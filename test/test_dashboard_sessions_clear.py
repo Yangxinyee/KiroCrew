@@ -25,6 +25,7 @@ from kiro_crew.dashboard.handlers import api_sessions_clear
 
 def _history_key_for(key: str) -> str:
     from kiro_crew.dashboard.chat import _history_key_for as _hkf
+
     return _hkf(key)
 
 
@@ -135,10 +136,13 @@ async def _call_and_parse(request: web.Request) -> tuple[int, dict]:
     """Invoke the handler and return (status, JSON body)."""
     from unittest.mock import patch
 
-    with patch(
-        "kiro_crew.dashboard.handlers._remove_slot_for_history_key",
-        new=AsyncMock(return_value=None),
-    ), patch("kiro_crew.dashboard.handlers.sel"):
+    with (
+        patch(
+            "kiro_crew.dashboard.handlers._remove_slot_for_history_key",
+            new=AsyncMock(return_value=None),
+        ),
+        patch("kiro_crew.dashboard.handlers.sel"),
+    ):
         resp = await api_sessions_clear(request)
     return resp.status, json.loads(resp.body.decode("utf-8"))
 
@@ -152,7 +156,7 @@ async def test_clears_all_when_nothing_protected() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 2, "skipped": 0, "failed": 0}
+    assert body == {"ok": True, "cleared": 2, "skipped": 0, "failed": 0, "undeletable": []}
     assert set(deleted) == {k1, k2}
 
 
@@ -166,7 +170,7 @@ async def test_skips_pinned_slot_in_memory() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
     assert deleted == [k2]
 
 
@@ -180,7 +184,7 @@ async def test_skips_running_slot_in_memory() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
     assert deleted == [k2]
 
 
@@ -195,7 +199,7 @@ async def test_skips_pinned_via_on_disk_metadata() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
     assert deleted == [k2]
 
 
@@ -225,7 +229,7 @@ async def test_skips_any_open_slot_even_if_unpinned_and_idle() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
     assert deleted == [k2]
 
 
@@ -240,7 +244,13 @@ async def test_none_metadata_does_not_crash() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {
+        "ok": True,
+        "cleared": 1,
+        "skipped": 0,
+        "failed": 0,
+        "undeletable": [{"id": k1, "code": "cron_ownership_unknown"}],
+    }
     assert deleted == [k2]
 
 
@@ -263,7 +273,7 @@ async def test_skips_open_slot_with_filesystem_underscore_key() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
     assert deleted == [fs_key_2]
 
 
@@ -281,7 +291,7 @@ async def test_skips_all_sessions_no_refresh() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 0, "skipped": 2, "failed": 0}
+    assert body == {"ok": True, "cleared": 0, "skipped": 2, "failed": 0, "undeletable": []}
     assert deleted == []
     state.push_slots_update.assert_not_called()
     state.push_refresh.assert_not_called()
@@ -299,7 +309,13 @@ async def test_skips_session_when_metadata_raises() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {
+        "ok": True,
+        "cleared": 1,
+        "skipped": 0,
+        "failed": 0,
+        "undeletable": [{"id": k1, "code": "cron_ownership_unknown"}],
+    }
     assert deleted == [k2]
 
 
@@ -319,7 +335,7 @@ async def test_delete_failure_tracked_as_failed() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": False, "cleared": 1, "skipped": 0, "failed": 1}
+    assert body == {"ok": False, "cleared": 1, "skipped": 0, "failed": 1, "undeletable": []}
 
 
 @pytest.mark.asyncio
@@ -339,7 +355,7 @@ async def test_delete_exception_tracked_as_failed() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": False, "cleared": 1, "skipped": 0, "failed": 1}
+    assert body == {"ok": False, "cleared": 1, "skipped": 0, "failed": 1, "undeletable": []}
 
 
 @pytest.mark.asyncio
@@ -353,7 +369,7 @@ async def test_all_failed_returns_ok_false() -> None:
     status, body = await _call_and_parse(request)
 
     assert status == 200
-    assert body == {"ok": False, "cleared": 0, "skipped": 0, "failed": 2}
+    assert body == {"ok": False, "cleared": 0, "skipped": 0, "failed": 2, "undeletable": []}
 
 
 @pytest.mark.asyncio
@@ -401,7 +417,7 @@ async def test_skips_the_transcript_an_unbound_channel_tab_is_reading() -> None:
     assert status == 200
     assert stem not in deleted
     assert deleted == [other]
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0, "undeletable": []}
 
 
 @pytest.mark.asyncio
@@ -446,4 +462,10 @@ async def test_skips_session_with_transient_unreadable_metadata() -> None:
     # k_pinned should be SKIPPED (unreadable), not deleted
     assert k_pinned not in deleted, "Pinned session with unreadable metadata was deleted!"
     assert deleted == [k_normal]
-    assert body == {"ok": True, "cleared": 1, "skipped": 1, "failed": 0}
+    assert body == {
+        "ok": True,
+        "cleared": 1,
+        "skipped": 0,
+        "failed": 0,
+        "undeletable": [{"id": k_pinned, "code": "cron_ownership_unknown"}],
+    }
