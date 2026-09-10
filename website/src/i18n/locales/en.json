@@ -1022,7 +1022,8 @@
         "highlight_7": "Pods run on Linux (systemd --user) and macOS (launchd) — but the macOS pod has no enforced memory/CPU ceiling; Make Live is still Linux-only; the fleet view, PR status, sync, rebase and prune work on any platform",
         "page_label": "Dev Fleet",
         "use_case_1": "Operate Kiro Crew feature worktrees and isolated preview pods while keeping the live gateway untouched.",
-        "configuration_1": "Point the app at a Kiro Crew checkout; PR actions need authenticated gh, while pods need systemd --user on Linux or launchd on macOS and must be provisioned first."
+        "configuration_1": "Point the app at a Kiro Crew checkout; PR actions need authenticated gh, while pods need systemd --user on Linux or launchd on macOS and must be provisioned first.",
+        "highlight_8": "One worktree per tagged release channel — stable and insider — so you can pod a shipped build beside your branch; it never changes which channel your own install updates from"
       }
     },
     "fileExplorer": {
@@ -3757,10 +3758,10 @@
         "backup_install_save": "Save name",
         "backup_install_rename_failed": "Couldn't save the install name. It is unchanged.",
         "backup_install_name_label": "Install name",
-        "backup_attribution_self": "{{label}} \u00b7 this install",
+        "backup_attribution_self": "{{label}} · this install",
         "backup_attribution_self_unnamed": "this install",
-        "backup_attribution_other": "\"{{label}}\" (another install \u00b7 {{id}})",
-        "backup_attribution_other_unnamed": "another install \u00b7 {{id}}",
+        "backup_attribution_other": "\"{{label}}\" (another install · {{id}})",
+        "backup_attribution_other_unnamed": "another install · {{id}}",
         "backup_attribution_unverified": "unverified origin",
         "backup_origin_unknown": "unknown origin",
         "backup_none_from_this_install": "No backups from this install. Include the other installs' archives to see theirs.",
