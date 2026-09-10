@@ -131,6 +131,7 @@ from kiro_crew.slack.format import (
     TRUNCATION_NOTICE,
     _convert_tables,
     extract_options,
+    render_for_slack,
     render_one_for_slack,
     split_message,
     strip_thinking_tags,
@@ -3048,6 +3049,9 @@ async def handle_message(
     thinking_ts: str | None = None  # 💭 reasoning placeholder, posted above the answer
     _show_thinking = KiroCrewConfig.load().slack.show_thinking
     _stream_had_redaction = False  # True when per-chunk redaction modified a streamed chunk
+    _stream_delta_dropped = False  # an append delta never landed on the live stream message
+    _stream_segment = ""  # text belonging to the CURRENT stream message (reset on rotation)
+    _delivery_incomplete = False  # end-of-turn recovery failed: shown text < accumulated
     # Rolling-buffer redactor for the live Slack wire: withholds the trailing
     # credential-class run so a credential split across streaming chunks can't
     # reach Slack unredacted (issue 3). The final message is posted from the
@@ -3068,19 +3072,63 @@ async def handle_message(
     _tool_gap = False
 
     async def _rotate_stream() -> str | None:
-        """Stop the dead stream and start a fresh one. Returns new ts or None."""
-        nonlocal stream_ts, use_slack_stream
+        """Stop the dead stream and start a fresh one. Returns new ts or None.
+
+        Best-effort: MUST NOT raise. The
+        real ``SlackClient`` swallows its own API errors, but a client or
+        transport that does not would send the exception up into the streaming
+        loop, where the typed ``except`` arms are all ``kiro_crew.acp.client``
+        errors — it reaches the generic ``except Exception`` catch-all, renders
+        the terminal "🔧 Something went wrong" message, and records a session
+        failure on a turn that is still live. A failed rotation is the existing,
+        handled outcome (``new_ts`` None → demote to chat.update), so map a
+        raise onto it.
+        """
+        nonlocal stream_ts, use_slack_stream, _stream_segment, _stream_delta_dropped
         if stream_ts:
-            await slack.stop_stream(channel, stream_ts)
-        new_ts = await slack.start_stream(
-            channel,
-            reply_ts,
-            initial_text=_STREAM_CONTINUED,
-            team_id=team_id or None,
-            user_id=user_id or None,
-        )
+            if _stream_delta_dropped:
+                # The message being abandoned is missing dropped deltas, and
+                # once rotation moves on nothing can reach it again — make it
+                # whole NOW via the lossless recovery render. Mid-turn, so
+                # best-effort: on success the debt is settled and the flag
+                # clears; on failure the flag AND the segment are retained, so
+                # the debt carries into the new message and end of turn
+                # delivers it there (never silently discarded).
+                try:
+                    await _deliver_segment_recovery()
+                    _stream_delta_dropped = False
+                except Exception:
+                    logger.warning(
+                        "Recovery of abandoned stream message failed — "
+                        "carrying the segment debt forward",
+                        exc_info=True,
+                    )
+            try:
+                await slack.stop_stream(channel, stream_ts)
+            except Exception:
+                logger.warning(
+                    "Slack stop_stream failed during rotation — abandoning old stream",
+                    exc_info=True,
+                )
+        try:
+            new_ts = await slack.start_stream(
+                channel,
+                reply_ts,
+                initial_text=_STREAM_CONTINUED,
+                team_id=team_id or None,
+                user_id=user_id or None,
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed during rotation", exc_info=True)
+            new_ts = None
         if new_ts:
             stream_ts = new_ts
+            # A fresh message begins: the recovery segment tracks the CURRENT
+            # message only, so re-rendering it can never duplicate text the
+            # abandoned message already shows. Unsettled debt (recovery above
+            # failed) carries forward instead of being discarded.
+            if not _stream_delta_dropped:
+                _stream_segment = ""
             logger.info("Stream rotated: new ts=%s", new_ts)
         else:
             use_slack_stream = False
@@ -3097,7 +3145,7 @@ async def handle_message(
         posted from the complete, fully-redacted ``accumulated`` at stop_stream,
         so the withheld tail is superseded — never lost.
         """
-        nonlocal _stream_had_redaction
+        nonlocal _stream_had_redaction, _stream_delta_dropped, _stream_segment
         if not stream_ts:
             return True
         if channel_activation == ACTIVATION_REVIEW:
@@ -3107,12 +3155,57 @@ async def handle_message(
             return True  # whole delta withheld (partial credential) — nothing to send yet
         if "[REDACTED" in safe:
             _stream_had_redaction = True
-        ok = await slack.append_stream(channel, stream_ts, safe)
+        # Best-effort: MUST NOT raise. A raising append is the same event as a
+        # refused append — the text is not on the stream — and the refusal path
+        # below (rotate, then retry once) already handles it. Letting it raise
+        # would escape into the generic catch-all below the loop and fake a
+        # terminal error on a live turn.
+        try:
+            ok = await slack.append_stream(channel, stream_ts, safe)
+        except Exception:
+            logger.warning("Slack append_stream failed — attempting rotation", exc_info=True)
+            ok = False
         if not ok and use_slack_stream:
             if await _rotate_stream():
                 assert stream_ts is not None
-                return await slack.append_stream(channel, stream_ts, safe)
+                try:
+                    ok = await slack.append_stream(channel, stream_ts, safe)
+                except Exception:
+                    logger.warning("Slack append_stream failed after rotation", exc_info=True)
+                    ok = False
+        if use_slack_stream:
+            # Track every delta belonging to the CURRENT stream message,
+            # delivered or dropped (rotation resets the segment first, so a
+            # retried delta lands in the new message's segment). The dropped-
+            # delta recovery re-renders exactly this segment over the current
+            # message — never text an earlier, abandoned message already shows.
+            _stream_segment += safe
+        if not ok and use_slack_stream:
+            # The delta never landed on a stream that is still the delivery
+            # surface (a failed rotation demotes to chat.update, which
+            # re-renders from ``accumulated`` — that path recovers on its own).
+            # Flag it so end of turn re-renders the segment instead of
+            # recording success on partial content: the real ``stop_stream``
+            # deliberately ignores ``final_text``.
+            _stream_delta_dropped = True
         return ok
+
+    async def _deliver_segment_recovery() -> None:
+        """Re-render the current segment over the stream message, losslessly.
+
+        ``render_for_slack`` is the lossless parts-list pipeline (normalise →
+        redact → pre-split → convert → redact → split), so an over-limit
+        segment arrives whole as ordered messages instead of being cut at the
+        single-message render's ceiling. Part one replaces the stream message;
+        overflow posts follow in-thread. Raises on delivery failure — each
+        caller decides whether that debt is carried (mid-turn) or propagated
+        (end of turn).
+        """
+        parts = render_for_slack(_stream_segment) or [_NO_RESPONSE]
+        assert stream_ts is not None
+        await slack.update_message(channel, stream_ts, parts[0])
+        for part in parts[1:]:
+            await slack.post_message(channel, part, reply_ts)
 
     async def _append_task(task_id: str, title: str, status: str, details: str = "") -> bool:
         """Append task card to stream. Never rotates — see below.
@@ -3199,7 +3292,7 @@ async def handle_message(
 
     async def _ensure_stream_started() -> None:
         """Lazy-start the stream on first event. Falls back to chat.update."""
-        nonlocal stream_ts, use_slack_stream, thinking_ts
+        nonlocal stream_ts, use_slack_stream, thinking_ts, _stream_segment
         if stream_ts is not None:
             return
         if channel_activation == ACTIVATION_REVIEW:
@@ -3220,10 +3313,24 @@ async def handle_message(
                 thinking_ts = await slack.post_message(channel, _THINKING_PLACEHOLDER, reply_ts)
             except Exception:
                 logger.debug("Failed to reserve thinking slot", exc_info=True)
-        stream_ts = await slack.start_stream(
-            channel, reply_ts, team_id=team_id or None, user_id=user_id or None
-        )
+        # Best-effort: MUST NOT raise. The real ``SlackClient.start_stream``
+        # swallows its own errors and returns None, but a client or transport
+        # that raises instead would escape into the loop's generic catch-all
+        # from the first TEXT_CHUNK or TOOL_CALL event. A raise is the same
+        # event as a None return — streaming is unavailable — so map it onto
+        # the existing demotion path below.
+        try:
+            stream_ts = await slack.start_stream(
+                channel, reply_ts, team_id=team_id or None, user_id=user_id or None
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed — demoting to chat.update", exc_info=True)
+            stream_ts = None
         use_slack_stream = stream_ts is not None
+        if use_slack_stream and not _stream_delta_dropped:
+            # A fresh stream message begins: the recovery segment tracks the
+            # current message only. Unsettled debt carries forward.
+            _stream_segment = ""
         if not use_slack_stream:
             # ``SlackClient.start_stream`` swallows its own errors and returns
             # None, but the ``chat.update`` fallback below goes through the base
@@ -3506,7 +3613,17 @@ async def handle_message(
                 accumulated += event.text
 
                 if _status_dirty and use_slack_stream:
-                    await slack.set_thread_status(channel, reply_ts, _STATUS_WORKING)
+                    # Best-effort: MUST NOT raise. The thread
+                    # status is decoration, and a raise here escapes into the
+                    # generic ``except Exception`` catch-all below the loop,
+                    # faking a terminal error on a live turn.
+                    try:
+                        await slack.set_thread_status(channel, reply_ts, _STATUS_WORKING)
+                    except Exception:
+                        logger.warning(
+                            "Slack set_thread_status failed — skipping status refresh",
+                            exc_info=True,
+                        )
                     _status_dirty = False
 
                 # ── Bracket hold-back: filter [OPTIONS: ...] from stream ──
@@ -3622,7 +3739,16 @@ async def handle_message(
                 tool_status = f"\n🫆 `{tool_name}`\n"
                 await _ensure_stream_started()
                 if use_slack_stream:
-                    await slack.set_thread_status(channel, reply_ts, f"is using {tool_name}")
+                    # Best-effort: MUST NOT raise. Decoration
+                    # only — a raise escapes to the catch-all and fakes a
+                    # terminal error on a live turn.
+                    try:
+                        await slack.set_thread_status(channel, reply_ts, f"is using {tool_name}")
+                    except Exception:
+                        logger.warning(
+                            "Slack set_thread_status failed — skipping tool status",
+                            exc_info=True,
+                        )
                     _status_dirty = True
                 if use_slack_stream:
                     # Flush any buffered text before the tool status
@@ -3676,9 +3802,40 @@ async def handle_message(
                         )
                         await _append_task(_active_task_id, _ct, "complete")
                         _active_task_id = ""
-                    await slack.stop_stream(channel, stream_ts)
+                    if _stream_delta_dropped:
+                        # A dropped delta is normally recovered at end of turn,
+                        # but this finalize abandons the message — recover it
+                        # here via the lossless recovery render. Delivery is
+                        # confirmed: on success the debt is settled; on
+                        # failure the flag and segment are retained, so the
+                        # debt carries into the post-wait message rather than
+                        # being discarded.
+                        try:
+                            await _deliver_segment_recovery()
+                            _stream_delta_dropped = False
+                        except Exception:
+                            logger.warning(
+                                "Wait-finalize recovery failed — "
+                                "carrying the segment debt forward",
+                                exc_info=True,
+                            )
+                    # Best-effort: MUST NOT raise. The stream is being
+                    # abandoned either way (``stream_ts`` is cleared just
+                    # below, and ``_ensure_stream_started`` opens a fresh
+                    # message after wait returns), so a raising ``stop_stream``
+                    # changes nothing except — unguarded — faking a terminal
+                    # error on a live turn via the catch-all.
+                    try:
+                        await slack.stop_stream(channel, stream_ts)
+                    except Exception:
+                        logger.warning(
+                            "Slack stop_stream failed at wait finalize — abandoning stream",
+                            exc_info=True,
+                        )
                     stream_ts = None
                     accumulated = ""
+                    if not _stream_delta_dropped:
+                        _stream_segment = ""
 
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 # Check tool hooks for auto-approve
@@ -4158,14 +4315,36 @@ async def handle_message(
         # either per-chunk during streaming (_stream_had_redaction), inside the
         # final render (_render_redacted), or caught by the post-decorator scan
         # (exfil_warnings/cred_warnings). The security invariant requires the
-        # final visible message reflect the redacted accumulated text; all other
-        # cases leave the rich render intact.
+        # final visible message reflect the redacted accumulated text; all
+        # other cases leave the rich render intact.
         #
         # _render_redacted is the one that catches an ANSI-obfuscated credential:
         # the per-chunk StreamRedactor sees raw chunks and does not strip escapes,
         # so it can miss one that only becomes matchable after normalisation —
         # and the post-decorator scan sees text the render has already cleaned.
-        if _stream_had_redaction or _render_redacted or exfil_warnings or cred_warnings:
+        if _stream_delta_dropped:
+            # An append delta never landed on the current stream message and
+            # the real stop_stream deliberately ignores final_text, so without
+            # this the turn records success on partial content. Re-render ONLY
+            # the current message's segment (rotation resets it, so text an
+            # earlier, abandoned message already shows is never duplicated),
+            # via the lossless recovery render. Delivery is confirmed: success
+            # accounting has already run by this point (its ordering is this
+            # module's, not this block's, to change), so a recovery failure is
+            # converted into an explicit failure record — the turn's recorded
+            # outcome matches what the reader actually got — rather than a
+            # raise escaping into a dispatch layer that never expects one
+            # after accounting.
+            try:
+                await _deliver_segment_recovery()
+            except Exception:
+                logger.error(
+                    "Dropped-delta recovery failed — recording turn failure",
+                    exc_info=True,
+                )
+                await sessions.record_failure(session_key)
+                _delivery_incomplete = True
+        elif _stream_had_redaction or _render_redacted or exfil_warnings or cred_warnings:
             fallback_text = _convert_tables(clean_text) if clean_text else _NO_RESPONSE
             await _safe_final_update(
                 slack, channel, stream_ts, fallback_text or _NO_RESPONSE, reply_ts
@@ -4248,11 +4427,21 @@ async def handle_message(
     if conversation_log and not _skip_writes:
         # The per-turn hot path: two appends every turn, so this is where the
         # ~12ms of loop time was paid most often.
+        _persist_text = accumulated
+        if _delivery_incomplete:
+            # The recovery could not put the full text on Slack, so part of
+            # ``accumulated`` was never shown. Persisting it unmarked would
+            # record unseen output as established history; the marker keeps
+            # the record honest (the transport path's rescue uses the same
+            # marker for the same reason).
+            from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
+
+            _persist_text = accumulated + PARTIAL_TURN_MARKER
         _turn_row_ts = await save_conversation_turn_off_loop(
             conversation_log,
             session_key,
             text,
-            accumulated,
+            _persist_text,
             source_thread=session_key,
             source_user=user_id,
             agent=_agent,
