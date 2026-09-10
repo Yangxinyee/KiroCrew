@@ -106,6 +106,11 @@ type PanelTarget = PanelTargetSingle | PanelTargetSingle[]
 export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'OverviewPanel.tsx': 'overview',
   'ChatPanel.tsx': 'chat',
+  // The Model-order drag list ChatPanel mounts. It renders no extractable
+  // Settings* primitive (custom dnd-kit markup), so it yields no auto-indexed
+  // rows; the mapping exists so the manual entry `chat.model-order`
+  // (settingsManual.ts) can anchor its data-setting-label to this file.
+  'ModelOrderCard.tsx': 'chat',
   'VoicePanel.tsx': 'voice',
   'DisplayPanel.tsx': 'display',
   'BrowserPanel.tsx': 'browser',
