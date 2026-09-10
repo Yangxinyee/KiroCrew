@@ -306,7 +306,14 @@ export function resolveUnarmedPhase(deadlineMs: number, now: number): 'expired' 
   return now >= deadlineMs ? 'expired' : 'applying'
 }
 
-function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
+export function InAppUpdateFlow({
+  version,
+  manualCommand,
+  isChannelMove,
+  onHandoff,
+  askAgent = true,
+  showIntro = true,
+}: {
   /**
    * DISPLAY ONLY — the label on the Arm button. `armUpdate()` sends no version
    * (the gateway arms against its own cached raw `latest_version`), so this is
@@ -324,6 +331,12 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
    * same direction-blind copy this change exists to remove.
    */
   isChannelMove?: boolean
+  /** Close an overlay host after Ask Agent successfully navigates to chat. */
+  onHandoff?: () => void
+  /** Disable hand-off where an enforcement overlay must remain visible. */
+  askAgent?: boolean
+  /** Settings explains the mechanism; modal hosts already state the task. */
+  showIntro?: boolean
 }) {
   const [phase, setPhase] = useState<'idle' | 'armed' | 'applying' | 'failed' | 'expired'>('idle')
   const [armed, setArmed] = useState<{
@@ -369,7 +382,9 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
         setArmError(res.error || i18nT('pages.settings.aboutPanel.update_failed'))
       }
     },
-    onError: (e: unknown) => setArmError(e instanceof ApiError ? e.message : String(e)),
+    onError: (e: unknown) => setArmError(
+      e instanceof ApiError ? e.message : i18nT('pages.settings.aboutPanel.update_failed'),
+    ),
   })
   // Countdown + liveness poll while ARMED. The count is cosmetic (the server
   // enforces the TTL); the poll is what notices the request being consumed —
@@ -431,119 +446,150 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
     if (phase !== 'applying' && phase !== 'armed') return
     if (progressStep === 'failed' || progressStep === 'error') setPhase('failed')
   }, [progressStep, phase])
-  if (phase === 'applying') {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update-applying">
-        <p className="text-[13px] text-text flex items-center gap-1.5">
-          <RefreshCw size={13} className="lucide-inline animate-spin text-accent" />
-          {i18nT('pages.settings.aboutPanel.applying_update')}
-        </p>
-        {progress?.detail && (
-          <p className="text-[12px] text-muted font-mono break-all" data-testid="apply-progress">
-            {progress.detail}
-          </p>
-        )}
-        <p className="text-[12px] text-muted">
-          {i18nT('pages.settings.aboutPanel.applying_restart_note')}
-        </p>
-      </div>
-    )
+  const resetFailure = () => {
+    setPhase('idle')
+    setArmed(null)
+    setCmdCopied(false)
+    setCmdCopyFailed(false)
   }
-  if (phase === 'failed') {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update-failed">
-        {/* askAgent on: a status panel with nothing editable. Try again stays a
-            sibling — retry and hand-off are different next steps. */}
-        <ErrorNotice message={progress?.detail || i18nT('pages.settings.aboutPanel.update_failed')} askAgent />
-        <div>
-          <Btn onClick={() => { setPhase('idle'); setArmed(null); setCmdCopied(false); setCmdCopyFailed(false) }}>
-            {i18nT('pages.settings.aboutPanel.try_again')}
-          </Btn>
-        </div>
-      </div>
-    )
+  const runAction = () => {
+    if (phase === 'armed' && armed) {
+      void copyCommand(armed.approveCommand, setCmdCopied, setCmdCopyFailed)
+      return
+    }
+    if (phase === 'failed') {
+      resetFailure()
+      return
+    }
+    if (phase !== 'applying') arm.mutate()
   }
-  if (phase !== 'armed' || !armed) {
-    return (
-      <div className="flex flex-col gap-2" data-testid="in-app-update">
-        {phase === 'expired' && (
-          <p className="text-[12px] text-muted" data-testid="arm-expired-note">
-            {i18nT('pages.settings.aboutPanel.approval_window_expired')}
+  const rootTestId = phase === 'armed'
+    ? 'in-app-update-armed'
+    : phase === 'applying'
+      ? 'in-app-update-applying'
+      : phase === 'failed'
+        ? 'in-app-update-failed'
+        : 'in-app-update'
+  const canStart = phase === 'idle' || phase === 'expired'
+
+  return (
+    <div className="flex flex-col gap-2" data-testid={rootTestId}>
+      {phase === 'applying' && (
+        <>
+          <p className="text-[13px] text-text flex items-center gap-1.5">
+            <RefreshCw size={13} className="lucide-inline animate-spin text-accent" />
+            {i18nT('pages.settings.aboutPanel.applying_update')}
           </p>
-        )}
-        <p className="text-[13px] text-muted">
-          {i18nT(isChannelMove
-            ? 'pages.settings.aboutPanel.in_app_channel_move_intro'
-            : 'pages.settings.aboutPanel.in_app_update_intro')}
-        </p>
-        <div>
-          <Btn primary onClick={() => arm.mutate()} disabled={arm.isPending}>
-            {/* A lane move rolls the version BACK, so the primary action that
-                performs it must not wear an upgrade arrow. */}
-            {isChannelMove
+          {progress?.detail && (
+            <p className="text-[12px] text-muted font-mono break-all" data-testid="apply-progress">
+              {progress.detail}
+            </p>
+          )}
+          <p className="text-[12px] text-muted">
+            {i18nT('pages.settings.aboutPanel.applying_restart_note')}
+          </p>
+        </>
+      )}
+
+      {phase === 'failed' && (
+        <ErrorNotice
+          message={progress?.detail || i18nT('pages.settings.aboutPanel.update_failed')}
+          askAgent={askAgent}
+          onHandoff={onHandoff}
+        />
+      )}
+
+      {canStart && (
+        <>
+          {phase === 'expired' && (
+            <p className="text-[12px] text-muted" data-testid="arm-expired-note">
+              {i18nT('pages.settings.aboutPanel.approval_window_expired')}
+            </p>
+          )}
+          {showIntro && (
+            <p className="text-[13px] text-muted">
+              {i18nT(isChannelMove
+                ? 'pages.settings.aboutPanel.in_app_channel_move_intro'
+                : 'pages.settings.aboutPanel.in_app_update_intro')}
+            </p>
+          )}
+          <ErrorNotice message={armError} askAgent={askAgent} onHandoff={onHandoff} testId="arm-error" />
+          {manualCommand && (
+            <details className="text-[12px] text-muted">
+              <summary className="cursor-pointer">{i18nT('pages.settings.aboutPanel.or_update_manually')}</summary>
+              <div className="mt-2 p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all">
+                {manualCommand}
+              </div>
+            </details>
+          )}
+        </>
+      )}
+
+      {phase === 'armed' && armed && (
+        <>
+          <p className="text-[13px] text-muted">
+            {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
+          </p>
+          <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+            data-testid="approve-command">
+            {armed.approveCommand}
+          </div>
+          <span className="text-[12px] text-muted" data-testid="arm-countdown">
+            {i18nT('pages.settings.aboutPanel.armed_expires_in', {
+              time: `${Math.floor(armed.expiresIn / 60)}:${String(armed.expiresIn % 60).padStart(2, '0')}`,
+            })}
+          </span>
+          {cmdCopyFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
+              askAgent={askAgent}
+              onHandoff={onHandoff}
+              testId="arm-copy-error"
+            />
+          )}
+          {armStatusQuery.failureCount >= ARM_POLL_FAILURE_THRESHOLD && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('pages.settings.aboutPanel.arm_status_poll_failing')}
+              askAgent={askAgent}
+              onHandoff={onHandoff}
+              testId="arm-poll-error"
+            />
+          )}
+          <p className="text-[12px] text-muted">
+            {i18nT('pages.settings.aboutPanel.armed_waiting_note')}
+          </p>
+        </>
+      )}
+
+      <div>
+        <Btn
+          key="update-action"
+          data-testid="in-app-update-action"
+          primary={canStart}
+          onClick={runAction}
+          disabled={arm.isPending || phase === 'applying'}
+        >
+          {phase === 'applying' ? (
+            <><RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.applying_update')}</>
+          ) : phase === 'armed' ? (
+            <><Copy size={13} className="lucide-inline" /> {cmdCopied
+              ? i18nT('pages.settings.aboutPanel.copied')
+              : i18nT('pages.settings.aboutPanel.copy_command')}</>
+          ) : phase === 'failed' ? (
+            i18nT('pages.settings.aboutPanel.try_again')
+          ) : (
+            <>{isChannelMove
               ? <GitBranch size={13} className="lucide-inline" />
               : <ArrowUp size={13} className="lucide-inline" />} {version
               ? i18nT(isChannelMove
                 ? 'pages.settings.aboutPanel.switch_to_version'
                 : 'pages.settings.aboutPanel.update_to_version', { version })
-              : i18nT('pages.settings.aboutPanel.update_now')}
-          </Btn>
-        </div>
-        {/* askAgent on: arming persists nothing client-side; the button above
-            is still there for a retry. */}
-        <ErrorNotice message={armError} askAgent testId="arm-error" />
-        <details className="text-[12px] text-muted">
-          <summary className="cursor-pointer">{i18nT('pages.settings.aboutPanel.or_update_manually')}</summary>
-          <div className="mt-2 p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all">
-            {manualCommand}
-          </div>
-        </details>
-      </div>
-    )
-  }
-  return (
-    <div className="flex flex-col gap-2" data-testid="in-app-update-armed">
-      <p className="text-[13px] text-muted">
-        {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
-      </p>
-      <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
-        data-testid="approve-command">
-        {armed.approveCommand}
-      </div>
-      <div className="flex items-center gap-2 flex-wrap">
-        <Btn onClick={() => copyCommand(armed.approveCommand, setCmdCopied, setCmdCopyFailed)}>
-          <Copy size={13} className="lucide-inline" /> {cmdCopied
-            ? i18nT('pages.settings.aboutPanel.copied')
-            : i18nT('pages.settings.aboutPanel.copy_command')}
+              : i18nT('pages.settings.aboutPanel.update_now')}</>
+          )}
         </Btn>
-        <span className="text-[12px] text-muted" data-testid="arm-countdown">
-          {i18nT('pages.settings.aboutPanel.armed_expires_in', {
-            time: `${Math.floor(armed.expiresIn / 60)}:${String(armed.expiresIn % 60).padStart(2, '0')}`,
-          })}
-        </span>
-        {/* askAgent on: the command is still on screen above to select by hand. */}
-        {cmdCopyFailed && (
-          <ErrorNotice
-            variant="inline"
-            message={i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually')}
-            askAgent
-          />
-        )}
       </div>
-      {/* A persistently failing poll means the approval landing can no longer be
-          observed from this tab. askAgent on: the armed request lives on the
-          gateway; nothing here is a draft. */}
-      {armStatusQuery.failureCount >= ARM_POLL_FAILURE_THRESHOLD && (
-        <ErrorNotice
-          variant="inline"
-          message={i18nT('pages.settings.aboutPanel.arm_status_poll_failing')}
-          askAgent
-          testId="arm-poll-error"
-        />
-      )}
-      <p className="text-[12px] text-muted">
-        {i18nT('pages.settings.aboutPanel.armed_waiting_note')}
-      </p>
     </div>
   )
 }

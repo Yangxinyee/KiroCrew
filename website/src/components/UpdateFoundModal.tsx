@@ -3,6 +3,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Trans } from 'react-i18next'
 import MarkdownRenderer from './MarkdownRenderer'
+import ErrorNotice from './ErrorNotice'
+import { InAppUpdateFlow } from '../pages/settings/AboutPanel'
 import { Download, X, Copy, Check } from 'lucide-react'
 
 import { api, ApiError } from '../api/client'
@@ -33,9 +35,9 @@ import type { UpdateState } from '../hooks/useUpdateSubscription'
  *   as UpdateModal. Primary action = consent to download; progress then
  *   lives on the top-bar pill and UpdateModal takes over at `downloaded`.
  * - Gateway: `update_available === true` on the status frame. The primary
- *   action follows `updateAffordance`: in-process apply where the install
- *   supports it, a copyable installer command where it does not. An install
- *   with no affordance at all is never interrupted.
+ *   action follows `updateAffordance`: in-process apply for a checkout,
+ *   host-local arm/approve for a managed venv, and the installer command only
+ *   where neither in-app path is available.
  *
  * Download consent stays with the user in every path: nothing downloads or
  * installs from merely showing this modal.
@@ -66,7 +68,7 @@ type Candidate = {
   displayVersion: string
   notes?: string
   /** Gateway only: which action the primary slot offers. */
-  affordance?: 'apply' | 'command'
+  affordance?: 'apply' | 'arm' | 'command'
   command?: string
 }
 
@@ -87,6 +89,7 @@ export default function UpdateFoundModal() {
   // Raw fallback below covers a gateway that predates the field.
   const gwVersionDisplay = useAppSelector(s => s.dashboard.status?.update_latest_version_display) || ''
   const gwCanApply = useAppSelector(s => s.dashboard.status?.update_can_apply)
+  const gwCanArm = useAppSelector(s => s.dashboard.status?.update_can_arm)
   const gwCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
   const gwRequired = useAppSelector(s => s.dashboard.status?.update_required === true)
   const gwMinVersion = useAppSelector(s => s.dashboard.status?.update_min_version) || ''
@@ -121,7 +124,9 @@ export default function UpdateFoundModal() {
       notes: desktop.notes,
     }
   } else if (gwAvailable && gwVersion) {
-    const afford = updateAffordance({ updateAvailable: true, canApply: gwCanApply, command: gwCommand })
+    const afford = updateAffordance({
+      updateAvailable: true, canApply: gwCanApply, canArm: gwCanArm, command: gwCommand,
+    })
     if (afford !== 'none') {
       candidate = {
         source: 'gateway', version: gwVersion,
@@ -149,6 +154,7 @@ export default function UpdateFoundModal() {
   const [dismissedVersion, setDismissedVersion] = useState('')
   const sessionDismissed = !!candidate && dismissedVersion === candidate.version
   const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState('')
   const [restarting, setRestarting] = useState(false)
   const [applyError, setApplyError] = useState('')
   const [persistError, setPersistError] = useState('')
@@ -266,6 +272,8 @@ export default function UpdateFoundModal() {
   const candidateVersion = candidate?.version ?? ''
   useEffect(() => {
     setPersistError('')
+    setApplyError('')
+    setCopyError('')
   }, [candidateVersion])
 
   // "Copied" is transient feedback, not a latch.
@@ -278,6 +286,24 @@ export default function UpdateFoundModal() {
   if (!open || !candidate) return null
 
   const notes = (candidate.source === 'gateway' ? gwCheck?.changes : candidate.notes)?.trim() || ''
+
+  const copyCandidateCommand = async () => {
+    const command = candidate.command || ''
+    setCopyError('')
+    setCopied(false)
+    try {
+      if (await copyToClipboard(command)) {
+        setCopied(true)
+        return
+      }
+    } catch {
+      // The shared notice below gives the user the same recovery action for a
+      // rejected Clipboard API call and a false legacy fallback result.
+    }
+    setCopyError(
+      i18nT('pages.settings.aboutPanel.copy_failed_select_the_command_and_copy_it_manually'),
+    )
+  }
 
   const primary = () => {
     if (candidate.source === 'desktop') {
@@ -376,10 +402,36 @@ export default function UpdateFoundModal() {
               {i18nT('components.updateFoundModal.nothing_downloads_until_you_choose_to')}
             </p>
           )}
-          {candidate.source === 'gateway' && candidate.affordance === 'command' && (
-            <code data-testid="update-found-command" className="block mt-2 text-[12px] bg-bg border border-border rounded-md px-2 py-1.5 overflow-x-auto whitespace-nowrap">{candidate.command}</code>
+          {candidate.source === 'gateway' && candidate.affordance === 'arm' && (
+            <div className="mt-2">
+              <InAppUpdateFlow
+                version={candidate.displayVersion}
+                manualCommand=""
+                onHandoff={required ? undefined : () => setDismissedVersion(candidate.version)}
+                askAgent={!required}
+                showIntro={false}
+              />
+            </div>
           )}
-          {applyError && <p className="mt-2 text-[12px] text-danger">{applyError}</p>}
+          {candidate.source === 'gateway' && candidate.affordance === 'command' && (
+            <code data-testid="update-found-command" className="block mt-2 text-[12px] bg-bg border border-border rounded-md px-2 py-1.5 overflow-x-auto whitespace-nowrap">
+              {candidate.command}
+            </code>
+          )}
+          <ErrorNotice
+            className="mt-2"
+            message={applyError}
+            askAgent={!required}
+            onHandoff={required ? undefined : () => setDismissedVersion(candidate.version)}
+            testId="update-found-action-error"
+          />
+          <ErrorNotice
+            className="mt-2"
+            message={copyError}
+            askAgent={!required}
+            onHandoff={required ? undefined : () => setDismissedVersion(candidate.version)}
+            testId="update-found-copy-error"
+          />
           {required && applyError && candidate.affordance === 'apply' && gwCommand && (
             // Escape hatch for the worst state: a mandatory update whose
             // in-process apply keeps failing would otherwise strand the user
@@ -421,7 +473,7 @@ export default function UpdateFoundModal() {
         {/* flex-wrap: two localized buttons (de runs long) can exceed a 320px
             footer's content box; wrapping stacks them instead of clipping the
             leading action. */}
-        <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2.5 border-t border-border bg-bg-elevated">
+        <div className={`flex flex-wrap items-center gap-2 px-4 py-2.5 border-t border-border bg-bg-elevated ${candidate.source === 'gateway' && candidate.affordance === 'arm' ? 'justify-start' : 'justify-end'}`}>
           {!required && (
           <button
             type="button"
@@ -436,12 +488,12 @@ export default function UpdateFoundModal() {
             <button
               type="button"
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-accent text-accent-fg hover:opacity-90 cursor-pointer"
-              onClick={async () => { await copyToClipboard(candidate.command || ''); setCopied(true) }}
+              onClick={copyCandidateCommand}
             >
               {copied ? <Check size={14} className="lucide-inline" /> : <Copy size={14} className="lucide-inline" />}
               {copied ? i18nT('components.updateFoundModal.copied') : i18nT('components.updateFoundModal.copy_command')}
             </button>
-          ) : (
+          ) : candidate.source === 'gateway' && candidate.affordance === 'arm' ? null : (
               <button
                 type="button"
                 className="px-3 py-1.5 text-sm rounded-md bg-accent text-accent-fg hover:opacity-90 cursor-pointer disabled:opacity-50"

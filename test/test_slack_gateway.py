@@ -8394,6 +8394,35 @@ class TestWheelApplyReadsTheCapabilityCommand:
         assert handlers._update_info["check_status"] == "succeeded"
         ds.push_refresh.assert_called_with("update_available")
 
+    @pytest.mark.asyncio
+    async def test_auto_update_busy_defers_provider_apply(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch._update_apply_deferred = False
+        orch._prepare_auto_update_apply = AsyncMock(return_value=False)
+        handlers._update_info.clear()
+        handlers._update_info.update({"update_available": False})
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+
+        cfg = MagicMock()
+        cfg.auto_update = True
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=True, remote_version="9.9.9")
+        )
+        provider.apply = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        with patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg):
+            await orch._check_for_updates_via_provider(provider)
+
+        provider.apply.assert_not_awaited()
+        assert handlers._update_info["update_available"] is True
+        assert handlers._update_info["latest_version"] == "9.9.9"
+
 
 class TestMandatoryUpdateOnWheelInstall:
     """A policy min-version makes an update mandatory. On a wheel/cli.sh install
@@ -8435,10 +8464,11 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        # The installer may only be driven for the `wheel` stamp: a `source`
-        # install carries the same command but re-running it builds a separate
-        # venv and loops forever.
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "wheel")
+        # Only the managed venv may drive cli.sh automatically. Runtime
+        # ownership covers both stamped and older unstamped managed installs.
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: True
+        )
 
         apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
@@ -8483,7 +8513,9 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "wheel")
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: True
+        )
 
         wheel_apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", AsyncMock())
@@ -8496,12 +8528,9 @@ class TestMandatoryUpdateOnWheelInstall:
         ds.push_refresh.assert_called_with("update_available")
 
     @pytest.mark.asyncio
-    async def test_mandatory_update_on_non_wheel_installer_badges(self, monkeypatch):
-        """An install that carries an installer command but is NOT the `wheel`
-        stamp (a cloud source tree) must notify rather than run the installer,
-        and the badge must light even when the check left `update_available`
-        False — a pre-release remote reads as not-newer while the floor still
-        mandates the update."""
+    async def test_mandatory_update_on_non_managed_installer_badges(self, monkeypatch):
+        """An install with an installer command outside the managed venv must
+        notify rather than run it, even when a floor mandates the update."""
         import kiro_crew.dashboard.handlers as handlers
         import kiro_crew.platform.update_governance as gov
 
@@ -8528,7 +8557,9 @@ class TestMandatoryUpdateOnWheelInstall:
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
         monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
-        monkeypatch.setattr("kiro_crew.slack.gateway.distribution", lambda: "source")
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: False
+        )
 
         apply_called = AsyncMock()
         wheel_apply_called = AsyncMock()

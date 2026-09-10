@@ -167,22 +167,7 @@ def _yolo_duration_fields() -> tuple[str, bool, list[str]]:
 async def api_status(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     uptime = time.time() - state.start_time
-    from kiro_crew.dashboard.handlers import (
-        _UPDATE_CHECK_INTERVAL,
-        _do_update_check,
-    )
     from kiro_crew.dashboard.handlers import updates as _updates_mod
-
-    # Auto-recheck every 12h in background. Tracked in ``_background_tasks`` (this
-    # module's own documented pattern) rather than left as a bare create_task: the
-    # check now performs network I/O with a multi-second timeout, so an untracked
-    # task can be garbage-collected mid-flight or still be pending when the loop
-    # closes. ``_do_update_check`` is additionally single-flight, because the
-    # interval clock is only stamped once a check finishes.
-    if time.time() - _updates_mod._last_update_check > _UPDATE_CHECK_INTERVAL:
-        _bg = asyncio.create_task(_do_update_check())
-        state._background_tasks.add(_bg)
-        _bg.add_done_callback(state._background_tasks.discard)
 
     data = state.status_snapshot(**_updates_mod.status_update_fields())  # type: ignore[arg-type]
     static_info = _get_static_system_info()
