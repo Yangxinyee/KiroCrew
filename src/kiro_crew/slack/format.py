@@ -22,6 +22,27 @@ SLACK_MAX_TEXT = 39_000
 # rationale. Per-choice whitespace is stripped by extract_options().
 _OPTIONS_RE = OPTIONS_RE_LINE
 
+# MCP name separator: a run of >= 2 underscores (``<server>___<tool>`` and
+# ``mcp__<server>__<tool>`` alike). Mirrors ``channel._MCP_SEPARATOR_RE``.
+_MCP_SEPARATOR_RE = re.compile(r"_{2,}")
+
+
+def is_wait_identity(tool_name: str) -> bool:
+    """True when a tool's programmatic name is the kirocrew-core ``wait`` tool.
+
+    Transports spell the identity three ways — ``wait`` (direct MCP),
+    ``kirocrew-core___wait`` (pooled gateway namespacing), ``mcp__kirocrew-core__wait``
+    (the ``mcp__<server>__<tool>`` form). Split on the LAST run of two or more
+    underscores and compare the final segment — the normalization
+    ``channel._blocked_tool_named`` and ``session_directive.match_tool`` already
+    share, mirrored here rather than re-spelled. A single underscore is not a
+    separator, so ``wait_for_ci`` stays a different tool and never rolls the
+    stream over.
+    """
+    name = (tool_name or "").strip().lower()
+    return bool(name) and _MCP_SEPARATOR_RE.split(name)[-1] == "wait"
+
+
 # Action ID prefix for OPTIONS buttons
 OPTIONS_ACTION_PREFIX = "options_choice_"
 
