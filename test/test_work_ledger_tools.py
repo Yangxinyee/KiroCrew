@@ -386,6 +386,8 @@ async def test_every_store_code_maps_to_the_status_the_rfc_tabulates():
         "unknown_item": 404,
         "already_bound": 409,
         "item_closed": 409,
+        "item_not_closed": 409,
+        "archive_conflict": 409,
         "item_cap_exceeded": 409,
         "depth_exceeded": 409,
         "field_too_long": 400,

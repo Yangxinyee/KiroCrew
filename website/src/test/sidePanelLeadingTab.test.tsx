@@ -64,6 +64,7 @@ import { PINNED_VIEWS, usePanelTabs, __resetPanelTabs } from '../hooks/usePanelT
 import type { SidePanelWithholdable } from '../pages/chat/SidePanel'
 
 const LEADING_ID = 'crew-summary'
+const LEADING_IDS = [LEADING_ID]
 
 /** Exposes the strip model so a case can act on it (open a view, close a tab)
  *  the way a host would, without reaching through the DOM for everything. */
@@ -72,7 +73,7 @@ let ctl: ReturnType<typeof usePanelTabs> | null = null
 let shown: string | null | undefined
 
 function Harness({ closable, slot = 'member-radar', hidden }: { closable: boolean; slot?: string; hidden?: ReadonlySet<SidePanelWithholdable> }) {
-  const tabsCtl = usePanelTabs(slot, undefined, { leadingId: LEADING_ID })
+  const tabsCtl = usePanelTabs(slot, undefined, { leadingIds: LEADING_IDS })
   ctl = tabsCtl
   return (
     <SidePanel
@@ -83,12 +84,12 @@ function Harness({ closable, slot = 'member-radar', hidden }: { closable: boolea
       canDockBottom={false}
       hiddenViews={hidden}
       onActiveTabChange={(id) => { shown = id }}
-      leadingTab={{
+      leadingTabs={[{
         id: LEADING_ID,
         title: 'Crew summary',
         icon: <span data-testid="leading-icon" />,
         render: () => <div data-testid="leading-body">radar summary</div>,
-      }}
+      }]}
     />
   )
 }

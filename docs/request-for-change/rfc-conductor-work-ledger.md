@@ -265,9 +265,13 @@ Rooted at `data_home()` from [`src/kiro_crew/config/paths.py`](../../src/kiro_cr
       it_1a2b3c4d.json       one item; two writers, per-item lock
       it_1a2b3c4d.jsonl      that item's events, append-only under the same lock
       it_1a2b3c4d.lock
+      it_5e6f7a8b.jsonl      retained events for an archived item
+      it_5e6f7a8b.lock       retained lock for that same item
+    archive/
+      it_5e6f7a8b.json       immutable terminal item, moved from items/
     channels/
       it_1a2b3c4d__it_9f8e7d6c.json   one open pair; conductor is sole writer
-    .lock                    guards conductor.json
+    .lock                    guards conductor.json, item cap and archive moves
   bindings/
     <worker-digest8>.json    {conductor_dir, item_id}; written once by the conductor
 ```
@@ -289,13 +293,70 @@ one file describes the pair, whichever end asks about it. The conductor is the o
 writer, exactly like `bindings/`, so the file needs no lock discipline beyond the
 atomic write itself.
 
-Caps: 32 items per conductor, 200 events per item with oldest-dropped, `depth` ≤ 2,
+Caps: 32 unarchived items per conductor (closed items count until explicitly
+archived), 200 events per item with oldest-dropped, `depth` ≤ 2,
 16 channel files per conductor, a channel TTL of at most 86400 seconds and at most 50
 messages over a channel's life. Every cap refuses rather than truncates, because a
 silent truncation leaves the worker believing its report landed whole. `message`
 events count against the same 200-per-item budget as everything else, which bounds how
 much peer traffic can push an item's own history off the end — and is a reason the
 per-channel message cap is 50 rather than unbounded.
+
+#### Archiving terminal items
+
+The owner can retire a closed item to free one of the conductor's 32 slots.
+`archive_work_item(slot_key: str, item_id: str) -> WorkItem` in
+`src/kiro_crew/work_ledger.py` accepts only `accepted`, `rejected` or `abandoned`
+items. A worker's `status: done` still needs review and cannot authorize archival.
+Archiving changes storage location only: it does not accept, reject, reopen,
+redispatch or otherwise change the work. The caller must retain its existing
+owner and current-generation authorization; this storage API adds no MCP action
+or worker permission.
+
+The move holds the conductor lock, then the existing item lock, in the same order
+as creation. While both are held, it checks the destination and uses
+`atomic_write.replace_with_retry` for one rename from `items/<id>.json` to
+`archive/<id>.json`. All create/archive writers serialize on that conductor lock.
+An occupied destination alongside an active item raises `archive_conflict` (409),
+including an identical copy; it is never replaced. An open item raises
+`item_not_closed` (409), an absent or unreadable-content item raises `unknown_item`,
+and I/O failures propagate as `OSError`. A retry after the move returns the
+existing terminal archive unchanged. Archive paths remain within the conductor's
+directory.
+
+The original JSON bytes, including fields unknown to this version, are retained.
+The existing event file, item lock and worker binding stay at their original
+paths. No archive event is appended: retirement must not evict an event from the
+already bounded history. This preserves the currently retained event tail;
+earlier coalesced or oldest-dropped events are not recovered. Existing binding
+rules and owner/private boundaries remain in force.
+
+`read_work_item` falls back to archived JSON only when the active file is missing,
+including a concurrent move between stat and open. `read_work_brief` therefore
+continues resolving the original worker binding, and late worker reports and
+conductor field writes still fail with `item_closed`. An archived record with a
+nonterminal state reads as absent; it cannot recreate writable work. Creation
+reserves IDs across both directories, including occupied corrupt records.
+
+`list_work_items` continues to enumerate only unarchived JSON, keeping ordinary
+board polling and conductor context bounded. History is explicitly requested:
+
+```python
+list_archived_work_items(
+    slot_key: str, *, after: str = "", limit: int = 32
+) -> tuple[list[WorkItem], str | None]
+```
+
+Pages use ascending item-ID order and an exclusive `after` cursor; limits must be
+integers from 1 through 32. The returned cursor is the last scanned ID when another
+page exists, otherwise `None`. Directory names are scanned with bounded memory,
+and at most `limit` JSON records are read per call; there is no whole-history
+record load or shared index. Invalid filenames and links are ignored. Corrupt or
+nonterminal records are skipped, so even a short or empty page may have a next
+cursor. A missing archive returns an empty page without creating anything; other
+I/O errors remain visible. Pagination is not a snapshot: an item newly archived
+before the current cursor appears on a fresh traversal. There is no restore,
+automatic pruning or cap increase.
 
 ### Tools
 
@@ -504,6 +565,16 @@ sequenceDiagram
 ```
 
 The seed is sent **after** the bind, which inverts the current skill's "seed before ledger row" rule. That rule exists so a crash cannot leave a ledger row with no session behind it; the inverted order trades that for "a worker never starts unbound", which is the failure the worker can actually see. A bound item with no session is visible and recoverable; an unbound running worker is neither.
+
+**Gateway-created subagents.** `src/kiro_crew/subagent_manager/run.py` is a narrowly
+trusted direct storage importer alongside the two dashboard handler modules. It
+binds a selected work item using the gateway-derived parent session identity and
+the freshly allocated subagent key before starting the provider. Binding must
+succeed before the worker executes; caller-supplied parent or worker keys do not
+establish authority. This uses the same ledger binding operation and terminal
+checks. It does not relax the HTTP caller checks, private visibility boundaries
+or worker field ownership. `test/test_work_ledger.py` pins the named importer set
+in both directions so this seam cannot silently spread to arbitrary callers.
 
 `session_create` records only `created_by` on the child today — no child list, no lineage chain, no depth counter. The binding file is therefore the whole relationship, and it is why the relationship is a file rather than an inference over session state.
 
@@ -851,6 +922,14 @@ Exit criteria:
 - `_coalesce_progress` does not collapse `message` events, asserted with two identical bodies.
 
 ### Phase 4 — the surfaces
+
+The member-scoped Tasks implementation in
+[crew-mode.md](../system-specs/modules/crew-mode.md#member-tasks) exposes the
+existing item and event projection through a separate owner-only route. It adds
+task capture and explicit steering, and includes worker keys for navigation
+through the existing member ownership check. This is narrower than this phase:
+channels, take-over, watch-based waking and retirement of the original conductor
+flow remain outside that implementation.
 
 Scope: the Crew page item table and event list, including the open channels with their expiry and remaining budget and any outstanding `request` awaiting a conductor's answer; the `goal-conductor/SKILL.md` rewrite replacing the transcript-reading patrol with a ledger read and adding the dispatch rule (leaf → `kirocrew-worker`, decomposable → `kirocrew-conductor` under the depth cap, specialist crew → that crew, with the transcript fallback named for a crew that does not mount `@kirocrew-work`); deletion of `ledger_entry.py` and its tests; a module spec in `docs/system-specs/modules/`, added to that directory's index.
 

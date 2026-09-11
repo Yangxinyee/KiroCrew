@@ -24,6 +24,18 @@ store field. An absent protected record for a V2 run returns
 legacy absence. A readable legacy run with no memory binding keeps V1. Retry and
 continuation preserve the store even when the parent uses different memory.
 
+`spawn_run(work_item_id=...)` optionally binds a single fresh run to an item in
+the verified caller's work ledger. Batch input is refused for this option. The
+HTTP preflight checks caller identity, item ownership, open state and absence of
+a worker. Admission retains the item id across queue waits. After normal spawn
+approval and memory-delegation validation, execution atomically binds the
+manager-generated `subagent:<id>` before allocating the provider. A conflicting
+or closed item refuses execution. The same run may reuse its own binding during
+a retry; new dispatches cannot reuse another run's binding. Work reports resolve
+the caller's durable binding and private process proof, never a caller-supplied
+item address. This is a narrow store import seam in `subagent_manager/run.py`;
+it does not expose dashboard session creation to private members.
+
 ## Constants
 
 | Constant | Value | Purpose |

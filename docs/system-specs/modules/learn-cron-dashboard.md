@@ -1,5 +1,11 @@
 # Self-Learning, Cron & Dashboard Modules
 
+The internal spawn handler accepts optional `work_item_id` for a single task.
+It validates the verified parent against the work ledger before submission and
+passes the item through ordinary scoped admission. The run manager publishes the
+binding only after approval and before provider execution; existing memory and
+submission accounting rules still apply. See [subagent](subagent.md).
+
 ## Overview
 
 Phase 5 adds self-learning from corrections, scheduled cron jobs, and a web dashboard.

@@ -6,12 +6,16 @@ Three ledgers carry that name, and they are not interchangeable.
 module is the third: a record two parties write and neither owns, so that a
 conductor learns what a worker did as DATA instead of reading its transcript.
 
-This module is the STORAGE layer only. Its one importer is
-``dashboard/handlers/work_ledger.py``, which serves the ``/api/work-ledger``
-routes; the MCP tools in :mod:`kiro_crew.mcp_work` (``work_brief``,
+This module is the STORAGE layer only. Its dashboard importers are
+``dashboard/handlers/work_ledger.py`` for the agent-only routes and
+``dashboard/handlers/member_work.py`` for the owner's member task board.
+``subagent_manager/run.py`` is the gateway's trusted bind-before-provider seam,
+using the derived parent identity and newly allocated subagent session key.
+The MCP tools in :mod:`kiro_crew.mcp_work` (``work_brief``,
 ``work_report``, ``work_ledger_read``, ``work_ledger_record``) reach it only
-through those routes. Every write therefore passes the two entry points below,
-so the writer-ownership rule is enforced in one place.
+through those routes. Item field writes pass the two entry points below,
+so the writer-ownership rule is enforced in one place. Owner-authorized retention
+uses :func:`archive_work_item`, which moves only a terminal item's existing JSON.
 
 WRITER OWNERSHIP is the whole design, and it is expressed as two entry points rather
 than one update function with a field allowlist:
@@ -27,10 +31,12 @@ names one — an absent parameter outlives an allowlist that must be kept correc
 fields are added. Phase 1 performs NO identity resolution; that is Phase 2's job at
 the tool layer, and the split shape here is what lets it be done by construction.
 
-LOCK ORDER, for the two paths that hold more than one lock. ``create`` enforces the
+LOCK ORDER, for the paths that hold more than one lock. ``create`` enforces the
 per-conductor item cap, which means reading the items directory, so it holds the
 conductor lock across the whole transaction and takes the new item's lock from
-inside that hold. ``bind`` holds the item lock and takes the worker's binding lock
+inside that hold. ``archive_work_item`` takes the same conductor -> item locks
+before freeing a slot, keeping the cap check and ID reservation serialized.
+``bind`` holds the item lock and takes the worker's binding lock
 from inside it, because "this worker holds no other open item" is a property of
 the binding file, not of the item. So: **conductor -> item -> binding(worker)**.
 No path anywhere takes any two of these in the other relative order, so the order
@@ -57,15 +63,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from heapq import nsmallest
 from pathlib import Path
 from typing import Any, Iterator
 
-from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry, replace_with_retry
 from kiro_crew.config.paths import data_home
 from kiro_crew.platform_compat import file_lock
 from kiro_crew.session_ledger import _store_name, resolved_within
@@ -147,6 +156,7 @@ CONDUCTOR_ACTIONS: frozenset[str] = frozenset(
 # --------------------------------------------------------------------------- #
 
 MAX_ITEMS_PER_CONDUCTOR = 32
+MAX_ARCHIVE_PAGE_SIZE = 32
 MAX_EVENTS_PER_ITEM = 200
 MAX_DEPTH = 2
 
@@ -182,6 +192,8 @@ CODE_NO_LEDGER = "no_ledger"
 CODE_UNKNOWN_ITEM = "unknown_item"
 CODE_ALREADY_BOUND = "already_bound"
 CODE_ITEM_CLOSED = "item_closed"
+CODE_ITEM_NOT_CLOSED = "item_not_closed"
+CODE_ARCHIVE_CONFLICT = "archive_conflict"
 CODE_ITEM_CAP_EXCEEDED = "item_cap_exceeded"
 CODE_DEPTH_EXCEEDED = "depth_exceeded"
 CODE_FIELD_TOO_LONG = "field_too_long"
@@ -467,6 +479,7 @@ _CONDUCTOR_FILE = "conductor.json"
 _KEY_FILE = "slot_key"
 _LOCK_FILE = ".lock"
 _ITEMS_DIR = "items"
+_ARCHIVE_DIR = "archive"
 _BINDINGS_DIR = "bindings"
 
 
@@ -490,7 +503,7 @@ def _require_item_id(item_id: str) -> str:
     each caller, because a caller-level check protects only the callers someone
     remembered.
     """
-    if not _ITEM_ID_RE.match(item_id or ""):
+    if not _ITEM_ID_RE.fullmatch(item_id or ""):
         raise WorkLedgerError(f"invalid item id {item_id!r}", code=CODE_INVALID_VALUE)
     return item_id
 
@@ -532,6 +545,18 @@ def items_dir(slot_key: str) -> Path:
 
 def item_path(slot_key: str, item_id: str) -> Path:
     return items_dir(slot_key) / f"{_require_item_id(item_id)}.json"
+
+
+def archive_dir(slot_key: str) -> Path:
+    """The conductor's archive directory, contained within its ledger."""
+    resolved = resolved_within(conductor_dir(slot_key), _ARCHIVE_DIR)
+    if resolved is None:
+        raise WorkLedgerError("archive path escapes the conductor", code=CODE_INVALID_VALUE)
+    return resolved
+
+
+def archived_item_path(slot_key: str, item_id: str) -> Path:
+    return archive_dir(slot_key) / f"{_require_item_id(item_id)}.json"
 
 
 def item_events_path(slot_key: str, item_id: str) -> Path:
@@ -627,12 +652,14 @@ def binding_lock(worker_slot_key: str) -> Iterator[None]:
 # --------------------------------------------------------------------------- #
 
 
-def _read_json_record(path: Path, *, strict: bool = False) -> Any | None:
+def _read_json_record(path: Path, *, strict: bool = False, missing_ok: bool = True) -> Any | None:
     """Parse a whole-file JSON record, or ``None`` when it cannot be trusted.
 
     ``strict=True`` keeps the corruption-reads-as-absent contract for CONTENT
     (torn, oversized, non-UTF-8) but re-raises an I/O error other than
-    ``FileNotFoundError``. A guard that must fail CLOSED uses it: a file that is
+    ``FileNotFoundError``. ``missing_ok=False`` also propagates absence, allowing
+    an item reader to follow an archive move without masking corrupt active data.
+    A guard that must fail CLOSED uses it: a file that is
     present but momentarily unreadable -- a Windows rename race, a permission
     blip -- must not be mistaken for a file that is gone.
 
@@ -661,6 +688,8 @@ def _read_json_record(path: Path, *, strict: bool = False) -> Any | None:
             return None
         return json.loads(read_bytes_with_retry(path).decode("utf-8"))
     except FileNotFoundError:
+        if not missing_ok:
+            raise
         return None
     except OSError:
         if strict:
@@ -708,14 +737,32 @@ def read_conductor(slot_key: str, *, strict: bool = False) -> ConductorRecord | 
 
 
 def read_work_item(slot_key: str, item_id: str, *, strict: bool = False) -> WorkItem | None:
-    """One item, or ``None`` when it is absent or unreadable. Lock-free.
+    """One active or archived item, or ``None`` when unreadable. Lock-free.
+
+    Only a missing active file falls back to the archive. This also covers a move
+    between stat and open; corruption or an I/O failure must not select a different
+    record. Archived records must be terminal so a malformed archive cannot be
+    resurrected by a worker report or conductor action.
+    """
+    try:
+        return _read_item_record(
+            item_path(slot_key, item_id), item_id, strict=strict, missing_ok=False
+        )
+    except FileNotFoundError:
+        return _read_archived_item(slot_key, item_id, strict=strict)
+
+
+def _read_item_record(
+    path: Path, item_id: str, *, strict: bool = False, missing_ok: bool = True
+) -> WorkItem | None:
+    """Read and validate an item at one location.
 
     A record whose stored ``item_id`` names a DIFFERENT item than the file it sits
     in reads as absent. The writer always keeps the two equal, so a mismatch is a
     misnamed or hand-moved file, and honouring its stored id would let a write
     taken under THIS item's lock land on THAT item's path.
     """
-    raw = _read_json_record(item_path(slot_key, item_id), strict=strict)
+    raw = _read_json_record(path, strict=strict, missing_ok=missing_ok)
     if raw is None:
         return None
     item = WorkItem.from_dict(raw)
@@ -729,8 +776,16 @@ def read_work_item(slot_key: str, item_id: str, *, strict: bool = False) -> Work
     return item
 
 
+def _read_archived_item(slot_key: str, item_id: str, *, strict: bool = False) -> WorkItem | None:
+    path = archived_item_path(slot_key, item_id)
+    if resolved_within(path.parent, path.name) is None:
+        raise WorkLedgerError("archived item path escapes the archive", code=CODE_INVALID_VALUE)
+    item = _read_item_record(path, item_id, strict=strict)
+    return item if item is not None and item.is_terminal else None
+
+
 def list_work_items(slot_key: str) -> list[WorkItem]:
-    """Every readable item, oldest first.
+    """Every readable unarchived item, oldest first.
 
     DERIVED by listing the items directory rather than read from an index, so there
     is no third writer over a file both parties care about, and therefore no index
@@ -746,13 +801,112 @@ def list_work_items(slot_key: str) -> list[WorkItem]:
         # The glob is a prefix match; only a full ``it_<8 hex>`` stem is an item.
         # A stray ``it_bad.json`` is corruption in the directory, and corruption
         # reads as absent here too rather than crashing every listing.
-        if not _ITEM_ID_RE.match(entry.stem):
+        if not _ITEM_ID_RE.fullmatch(entry.stem):
             continue
-        item = read_work_item(slot_key, entry.stem)
+        item = _read_item_record(entry, entry.stem)
         if item is not None:
             items.append(item)
     items.sort(key=lambda it: (it.created_at, it.item_id))
     return items
+
+
+def list_archived_work_items(
+    slot_key: str, *, after: str = "", limit: int = MAX_ARCHIVE_PAGE_SIZE
+) -> tuple[list[WorkItem], str | None]:
+    """Read one archive page in ascending item-ID order, strictly after *after*.
+
+    Scans names with bounded memory and reads at most ``limit`` records; it never
+    loads history into the active board. ``next_after`` is the last scanned ID when
+    more candidates remain. Corrupt records are skipped, so a short or empty page
+    may still have a cursor. A new archive sorting before the cursor appears on a
+    fresh traversal; pages are not a snapshot across concurrent archives.
+
+    Missing history returns an empty page without creating a directory. Other I/O
+    errors propagate, and invalid limits/cursors raise ``invalid_value``.
+    """
+    if type(limit) is not int or not 1 <= limit <= MAX_ARCHIVE_PAGE_SIZE:
+        raise WorkLedgerError(
+            f"limit must be between 1 and {MAX_ARCHIVE_PAGE_SIZE}",
+            code=CODE_INVALID_VALUE,
+            field="limit",
+        )
+    if not isinstance(after, str) or (after and not _ITEM_ID_RE.fullmatch(after)):
+        raise WorkLedgerError("invalid archive cursor", code=CODE_INVALID_VALUE, field="after")
+    try:
+        with os.scandir(archive_dir(slot_key)) as entries:
+            candidates = nsmallest(
+                limit + 1,
+                (
+                    entry.name[:-5]
+                    for entry in entries
+                    if entry.name.endswith(".json")
+                    and _ITEM_ID_RE.fullmatch(entry.name[:-5])
+                    and entry.name[:-5] > after
+                    and entry.is_file(follow_symlinks=False)
+                ),
+            )
+    except FileNotFoundError:
+        return [], None
+    items = []
+    for item_id in candidates[:limit]:
+        item = _read_archived_item(slot_key, item_id, strict=True)
+        if item is not None:
+            items.append(item)
+    next_after = candidates[limit - 1] if len(candidates) > limit else None
+    return items, next_after
+
+
+def _path_occupied(path: Path) -> bool:
+    """Reserve even corrupt records and dangling links; fail closed on I/O errors."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def archive_work_item(slot_key: str, item_id: str) -> WorkItem:
+    """Retire one terminal item without changing its bytes, events or binding.
+
+    The caller supplies owner authorization. This is retention, not a conductor
+    field action: it cannot close work, dispatch a worker, or grant access.
+    All create/archive writers hold the conductor lock, and item writers share the
+    unchanged item lock. A single rename commits the move; a destination already
+    present alongside the active item is ALWAYS a conflict, even with equal bytes.
+    A retry with only a readable terminal archive returns that item unchanged.
+    """
+    checked_id = _require_item_id(item_id)
+    with conductor_lock(slot_key):
+        source = item_path(slot_key, checked_id)
+        if resolved_within(conductor_dir(slot_key), str(Path(_ITEMS_DIR) / source.name)) is None:
+            raise WorkLedgerError("item path escapes the conductor", code=CODE_INVALID_VALUE)
+        with item_lock(slot_key, checked_id):
+            target = archived_item_path(slot_key, checked_id)
+            if not _path_occupied(source):
+                item = _read_archived_item(slot_key, checked_id, strict=True)
+                if item is not None:
+                    return item
+                raise WorkLedgerError(
+                    f"unknown item {checked_id!r}", code=CODE_UNKNOWN_ITEM, field="item_id"
+                )
+            if _path_occupied(target):
+                raise WorkLedgerError(
+                    f"archive already contains {checked_id!r}", code=CODE_ARCHIVE_CONFLICT
+                )
+            if not stat.S_ISREG(source.lstat().st_mode):
+                raise WorkLedgerError("item must be a regular file", code=CODE_INVALID_VALUE)
+            item = _read_item_record(source, checked_id, strict=True)
+            if item is None:
+                raise WorkLedgerError(
+                    f"unknown item {checked_id!r}", code=CODE_UNKNOWN_ITEM, field="item_id"
+                )
+            if not item.is_terminal:
+                raise WorkLedgerError(
+                    f"item {checked_id!r} is still open", code=CODE_ITEM_NOT_CLOSED
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            replace_with_retry(source, target)
+            return item
 
 
 # --------------------------------------------------------------------------- #
@@ -1291,7 +1445,7 @@ def read_binding(worker_slot_key: str, *, strict: bool = False) -> tuple[str, st
         return None
     conductor = _as_str(raw.get("conductor_slot_key"))
     item_id = _as_str(raw.get("item_id"))
-    if not conductor or not _ITEM_ID_RE.match(item_id):
+    if not conductor or not _ITEM_ID_RE.fullmatch(item_id):
         return None
     return conductor, item_id
 
@@ -1557,7 +1711,9 @@ def _create_item(
                 field="items",
             )
         item_id = mint_item_id()
-        while (items_dir(slot_key) / f"{item_id}.json").exists():
+        while _path_occupied(item_path(slot_key, item_id)) or _path_occupied(
+            archived_item_path(slot_key, item_id)
+        ):
             item_id = mint_item_id()
         item = WorkItem(
             item_id=item_id,

@@ -49,7 +49,7 @@ from aiohttp import web
 
 from kiro_crew import session_ledger, work_ledger
 from kiro_crew.dashboard import session_control
-from kiro_crew.dashboard.handlers._shared import _is_restricted_session
+from kiro_crew.dashboard.handlers._shared import _is_restricted_session, internal_memory_scope
 
 # Module-scope like ``session_ledger.py``'s identical imports: the recognition
 # gate and the incognito classifier are this module's own load-bearing deps.
@@ -78,6 +78,8 @@ _CODE_STATUS: dict[str, int] = {
     work_ledger.CODE_UNKNOWN_ITEM: 404,
     work_ledger.CODE_ALREADY_BOUND: 409,
     work_ledger.CODE_ITEM_CLOSED: 409,
+    work_ledger.CODE_ITEM_NOT_CLOSED: 409,
+    work_ledger.CODE_ARCHIVE_CONFLICT: 409,
     work_ledger.CODE_ITEM_CAP_EXCEEDED: 409,
     work_ledger.CODE_DEPTH_EXCEEDED: 409,
     work_ledger.CODE_FIELD_TOO_LONG: 400,
@@ -239,8 +241,22 @@ async def _caller_key(
         )
     state: DashboardState = request.app["state"]
     sk = request.headers.get("X-Session-Key", "")
-    refusal = await _recognize_session(
-        state, sk, operation, blocks_persisted_mode=is_incognito_transcript
+    _, refusal = await internal_memory_scope(request, operation, claimed_session=sk)
+    if refusal is not None:
+        return None, refusal
+    # A scoped spawned worker has no dashboard slot. Its durable binding was
+    # published by the manager before execution, and private process identity is
+    # checked above just as it is for the member's own tools.
+    bound_run = (
+        sk.startswith("subagent:")
+        and await asyncio.to_thread(work_ledger.read_binding, sk) is not None
+    )
+    refusal = (
+        None
+        if bound_run
+        else await _recognize_session(
+            state, sk, operation, blocks_persisted_mode=is_incognito_transcript
+        )
     )
     if refusal is not None:
         return None, refusal
@@ -284,6 +300,31 @@ async def _caller_key(
             "sessions a conductor binds nor be one.",
         )
     return session_ledger.ledger_key(sk), None
+
+
+async def validate_work_dispatch(
+    request: web.Request, parent_session: str, item_id: str
+) -> web.Response | None:
+    """Preflight a spawn against only the verified caller's own ledger."""
+    key, refusal = await _caller_key(request, "work_ledger.dispatch")
+    if refusal is not None:
+        return refusal
+    if key != session_ledger.ledger_key(parent_session):
+        return _refuse_403("worker_not_owned", "The task must belong to the calling session.")
+    assert key is not None
+    try:
+        item = await asyncio.to_thread(work_ledger.read_work_item, key, item_id, strict=True)
+    except WorkLedgerError as exc:
+        return _refuse_store_error(exc)
+    except OSError:
+        return _refuse_503("ledger_write_failed", "The task record could not be read.")
+    if item is None:
+        return _refuse_404("unknown_item", "This task is unavailable.")
+    if item.state != "open":
+        return _refuse_409("item_closed", "A closed task cannot be dispatched.")
+    if item.worker_session_key:
+        return _refuse_409("already_bound", "This task already has a worker.")
+    return None
 
 
 def _reaches_a_channel(request: web.Request, sk: str) -> bool:
@@ -508,6 +549,32 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
     assert record is not None
 
     state: DashboardState = request.app["state"]
+    payload = await read_ledger_snapshot(state, key, record)
+
+    if _reaches_a_channel(request, request.headers.get("X-Session-Key", "")):
+        _audit(
+            request.headers.get("X-Session-Key", "") or "anonymous",
+            "work_ledger_read",
+            "denied",
+            resources="channel_agent_block_post_read",
+        )
+        return _refuse_403(
+            "channel_session",
+            "This session gained a channel mirror while the ledger was being read, "
+            "so it is no longer a private surface to return it to.",
+        )
+    _audit(key, "work_ledger_read", "ok", resources=f"{len(payload['items'])} item(s)")
+    return web.json_response(payload)
+
+
+async def read_ledger_snapshot(
+    state: DashboardState, key: str, record: work_ledger.ConductorRecord
+) -> dict[str, Any]:
+    """Project one authorized ledger for the MCP and owner-dashboard readers.
+
+    Authentication belongs to each caller. Sharing the projection keeps the
+    board's worker liveness and acceptance verdicts aligned with the conductor.
+    """
     items = await asyncio.to_thread(work_ledger.list_work_items, key)
     # Liveness is read straight off the dashboard's own slot table rather than
     # over HTTP: this handler runs in the process that owns it. ``orphaned`` asks
@@ -530,28 +597,11 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
         row["events"] = [event.to_dict() for event in events]
         rows.append(row)
 
-    if _reaches_a_channel(request, request.headers.get("X-Session-Key", "")):
-        # Same post-await re-check as ``work_brief``. This payload is larger: every
-        # item's acceptance bar plus worker-authored prose for the whole fleet.
-        _audit(
-            request.headers.get("X-Session-Key", "") or "anonymous",
-            "work_ledger_read",
-            "denied",
-            resources="channel_agent_block_post_read",
-        )
-        return _refuse_403(
-            "channel_session",
-            "This session gained a channel mirror while the ledger was being read, "
-            "so it is no longer a private surface to return it to.",
-        )
-    _audit(key, "work_ledger_read", "ok", resources=f"{len(rows)} item(s)")
-    return web.json_response(
-        {
-            "conductor": record.to_dict(),
-            "items": rows,
-            "accept_batch": work_ledger.accept_batch(items),
-        }
-    )
+    return {
+        "conductor": record.to_dict(),
+        "items": rows,
+        "accept_batch": work_ledger.accept_batch(items),
+    }
 
 
 #: Events returned per item. The log is append-only and capped at 200 per item,
@@ -576,6 +626,14 @@ def _slot_running(state: DashboardState, key: str) -> bool:
     testing slot EXISTENCE here would never flag it. ``orphaned`` keeps the
     existence test, because a conductor's absence is what that flag means.
     """
+    if key.startswith("subagent:"):
+        manager = getattr(state, "subagents", None)
+        return bool(
+            manager
+            and any(
+                (info.conversation_key or f"subagent:{info.id}") == key for info in manager.running
+            )
+        )
     slot = _find_slot(state, key)
     return bool(getattr(slot, "running", False)) if slot is not None else False
 

@@ -1193,6 +1193,7 @@ class SubagentInfo:
     # record, and the handler answers 429 from that absence.
     error_code: str = ""
     parent_session_key: str = ""
+    work_item_id: str = ""
     agent: str = ""
     # The app that spawned this child (empty for a non-app spawn). Persisted so
     # the child's per-tool-call gate can resolve the app's Level-2 profile, not
@@ -2265,6 +2266,7 @@ class SubagentManager:
         include_lessons: bool = True,
         include_project: bool = True,
         memory_store: str = "",
+        work_item_id: str = "",
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
@@ -2290,6 +2292,7 @@ class SubagentManager:
             include_lessons,
             include_project,
             memory_store,
+            work_item_id,
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,

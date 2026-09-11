@@ -20,6 +20,13 @@ own gate model is [computer-use](../system-specs/modules/computer-use.md).
 > or run `kirocrew cli-setup`, which calls the narrowly-scoped
 > `mcp_cleanup.clean_stale_managed_mcp()` helper.
 
+`spawn_run(work_item_id=...)` uses the strict session identity gate and forwards
+that exact key on the wire. It supports one task only and delegates through the
+existing scoped spawn endpoint; the gateway derives the worker identity and binds
+it before execution. The worker template carries `work_brief` and `work_report`.
+Private reports additionally verify the authenticated process's protected memory
+binding. See [subagent](../system-specs/modules/subagent.md).
+
 ## Config file hierarchy
 
 | File | Owner | Purpose | Read by |
@@ -892,6 +899,14 @@ gates nothing an unreferenced server was not already denying.
 **Granularity: the set, not the tool.** A spec that references a server gets
 every tool in it. So a capability that must be grantable *separately* belongs in
 a server of its own, not alongside a set someone might want for other reasons.
+
+Crew Members additionally assigns `kirocrew-work` at the existing per-session
+member injection seam, alongside `kirocrew-dashboard`. Both carry the member's
+strict session identity, gateway port and data-home override. This assignment
+does not edit the shared template or grant work tools auto-approval. The worker
+tools still resolve exactly one binding, and conductor tools still address only
+their caller's ledger. The owner task board uses separate member-scoped dashboard
+routes; it never relaxes the agent-only work-ledger routes.
 
 **A grant is not authority over everything the tools can name.** Assignment says
 which agent may call a set; it does not say what that agent may reach. The

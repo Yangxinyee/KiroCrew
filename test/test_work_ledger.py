@@ -5,8 +5,8 @@ Phase 1 lists: every enum and cap fails a test if its value changes; two concurr
 writers against one item leave a parseable record and an uninterleaved event log; a
 torn, truncated or oversized file reads as absent; a refused cap leaves the prior
 bytes untouched; ``depth`` at the cap refuses ``create``; consecutive ``progress``
-reports coalesce; a duplicated event line collapses on read; and only the Phase 2
-routes module imports the store (an allowlist that was an empty set while Phase 1
+reports coalesce; a duplicated event line collapses on read; and only named
+identity-resolving seams import the store (an allowlist that was empty while Phase 1
 stood alone, so that phase reverted by deleting two files).
 """
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -119,7 +120,16 @@ def test_item_id_is_server_minted_and_shape_checked():
 
 @pytest.mark.parametrize(
     "bad",
-    ["", "it_", "it_XYZ", "it_1a2b3c4", "../etc/passwd", "/abs/it_1a2b3c4d", "it_1a2b3c4d.json"],
+    [
+        "",
+        "it_",
+        "it_XYZ",
+        "it_1a2b3c4",
+        "../etc/passwd",
+        "/abs/it_1a2b3c4d",
+        "it_1a2b3c4d.json",
+        "it_1a2b3c4d\n",
+    ],
 )
 def test_a_model_supplied_string_cannot_reach_a_path_component(bad):
     with pytest.raises(wl.WorkLedgerError) as caught:
@@ -1829,24 +1839,382 @@ def test_acquiring_a_lock_does_not_truncate_the_lock_file():
     assert lock_path.read_bytes() == sentinel
 
 
+class TestArchivedWorkItems:
+    @staticmethod
+    def _closed_item(*, state="accepted"):
+        item_id = _new_item()
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state=state)
+        return item_id
+
+    def test_fill_cap_archive_create_retains_the_bound_items_history(self):
+        item_id = _new_item()
+        wl.apply_conductor_action(CONDUCTOR, "bind", item_id=item_id, worker_session_key=WORKER)
+        wl.apply_worker_report(
+            CONDUCTOR,
+            item_id,
+            status="done",
+            summary="ready to review",
+            artifacts={"branch": "feature/ship"},
+            pr=123,
+        )
+        wl.apply_conductor_action(
+            CONDUCTOR, "close", item_id=item_id, state="accepted", decision="checked"
+        )
+        for _ in range(wl.MAX_ITEMS_PER_CONDUCTOR - 1):
+            _new_item()
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            _new_item()
+        assert caught.value.code == wl.CODE_ITEM_CAP_EXCEEDED
+
+        # Preserve unknown fields and formatting too: archival must not reserialize.
+        source = wl.item_path(CONDUCTOR, item_id)
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        raw["future_field"] = {"retain": 'quotes " and brackets []'}
+        source.write_text(json.dumps(raw, indent=4) + "\n\n", encoding="utf-8")
+        item_bytes, event_bytes = _bytes_on_disk(item_id)
+        binding_bytes = wl.binding_path(WORKER).read_bytes()
+        lock_path = wl._item_lock_path(CONDUCTOR, item_id)
+        lock_path.write_bytes(b"existing lock\n")
+        original = wl.read_work_item(CONDUCTOR, item_id)
+        original_brief = wl.read_work_brief(CONDUCTOR, item_id)
+        original_events = wl.read_events(CONDUCTOR, item_id)
+
+        assert wl.archive_work_item(CONDUCTOR, item_id) == original
+        assert not source.exists()
+        assert len(wl.list_work_items(CONDUCTOR)) == wl.MAX_ITEMS_PER_CONDUCTOR - 1
+        assert _new_item() != item_id
+        assert len(wl.list_work_items(CONDUCTOR)) == wl.MAX_ITEMS_PER_CONDUCTOR
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            _new_item()
+        assert caught.value.code == wl.CODE_ITEM_CAP_EXCEEDED
+
+        assert wl.archive_work_item(CONDUCTOR, item_id) == original
+        assert wl.read_work_item(CONDUCTOR, item_id) == original
+        assert wl.read_work_brief(CONDUCTOR, item_id) == original_brief
+        assert wl.read_events(CONDUCTOR, item_id) == original_events
+        assert wl.read_binding(WORKER) == (CONDUCTOR, item_id)
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.apply_worker_report(CONDUCTOR, item_id, status="progress", summary="late")
+        assert caught.value.code == wl.CODE_ITEM_CLOSED
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.apply_conductor_action(CONDUCTOR, "decide", item_id=item_id, decision="late")
+        assert caught.value.code == wl.CODE_ITEM_CLOSED
+
+        assert not source.exists()
+        assert wl.archived_item_path(CONDUCTOR, item_id).read_bytes() == item_bytes
+        assert wl.item_events_path(CONDUCTOR, item_id).read_bytes() == event_bytes
+        assert wl.binding_path(WORKER).read_bytes() == binding_bytes
+        assert lock_path.read_bytes() == b"existing lock\n"
+
+    @pytest.mark.parametrize("state", sorted(wl.TERMINAL_ITEM_STATES))
+    def test_each_terminal_disposition_can_be_archived(self, state):
+        item_id = self._closed_item(state=state)
+        assert wl.archive_work_item(CONDUCTOR, item_id).state == state
+        assert wl.list_archived_work_items(CONDUCTOR) == (
+            [wl.read_work_item(CONDUCTOR, item_id)],
+            None,
+        )
+        assert wl.list_work_items(CONDUCTOR) == []
+
+    @pytest.mark.parametrize("status", [None, *sorted(wl.WORKER_STATUSES)])
+    def test_a_worker_status_including_done_does_not_authorize_archiving(self, status):
+        item_id = _new_item()
+        if status:
+            wl.apply_worker_report(CONDUCTOR, item_id, status=status, summary="update")
+        before = _bytes_on_disk(item_id)
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, item_id)
+        assert caught.value.code == wl.CODE_ITEM_NOT_CLOSED
+        assert _bytes_on_disk(item_id) == before
+        assert not wl.archive_dir(CONDUCTOR).exists()
+
+    @pytest.mark.parametrize("same_bytes", [False, True])
+    def test_an_occupied_archive_never_overwrites_either_record(self, same_bytes):
+        item_id = self._closed_item()
+        before = _bytes_on_disk(item_id)
+        target = wl.archived_item_path(CONDUCTOR, item_id)
+        target.parent.mkdir()
+        conflict = before[0] if same_bytes else b'{"preexisting": "do not overwrite"}\n'
+        target.write_bytes(conflict)
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, item_id)
+        assert caught.value.code == wl.CODE_ARCHIVE_CONFLICT
+        assert _bytes_on_disk(item_id) == before
+        assert target.read_bytes() == conflict
+
+    def test_a_failed_rename_keeps_the_active_record_and_can_be_retried(self):
+        item_id = self._closed_item()
+        before = _bytes_on_disk(item_id)
+        with mock.patch.object(wl, "replace_with_retry", side_effect=OSError("rename failed")):
+            with pytest.raises(OSError, match="rename failed"):
+                wl.archive_work_item(CONDUCTOR, item_id)
+        assert _bytes_on_disk(item_id) == before
+        assert not wl.archived_item_path(CONDUCTOR, item_id).exists()
+        assert wl.archive_work_item(CONDUCTOR, item_id).is_terminal
+        assert wl.archived_item_path(CONDUCTOR, item_id).read_bytes() == before[0]
+
+    def test_ids_are_reserved_in_active_and_archive_even_when_corrupt(self):
+        archived = self._closed_item()
+        wl.archive_work_item(CONDUCTOR, archived)
+        active = _new_item()
+        corrupt = "it_11111111"
+        available = "it_22222222"
+        wl.archived_item_path(CONDUCTOR, corrupt).write_bytes(b"{torn")
+        with mock.patch.object(
+            wl, "mint_item_id", side_effect=[archived, active, corrupt, available]
+        ):
+            assert _new_item() == available
+        assert wl.archived_item_path(CONDUCTOR, corrupt).read_bytes() == b"{torn"
+        assert wl.read_work_item(CONDUCTOR, archived).is_terminal
+        assert wl.read_work_item(CONDUCTOR, active).state == "open"
+
+    def test_archive_pages_are_stable_exclusive_and_read_only_one_page(self):
+        ids = [f"it_{i:08x}" for i in (5, 2, 4, 1, 3)]
+        with mock.patch.object(wl, "mint_item_id", side_effect=ids):
+            for _ in ids:
+                wl.archive_work_item(CONDUCTOR, self._closed_item())
+        # The ordinary board read must not load any archive JSON.
+        with mock.patch.object(wl, "_read_json_record", wraps=wl._read_json_record) as reads:
+            assert wl.list_work_items(CONDUCTOR) == []
+        assert reads.call_count == 0
+        seen = []
+        after = ""
+        for _ in ids:
+            with mock.patch.object(wl, "_read_json_record", wraps=wl._read_json_record) as reads:
+                page, next_after = wl.list_archived_work_items(CONDUCTOR, after=after, limit=2)
+            assert reads.call_count <= 2
+            assert all(
+                call.args[0].parent == wl.archive_dir(CONDUCTOR) for call in reads.call_args_list
+            )
+            seen.extend(item.item_id for item in page)
+            if next_after is None:
+                break
+            assert next_after > after
+            after = next_after
+        else:
+            pytest.fail("archive pagination did not terminate")
+        assert seen == sorted(ids)
+        assert wl.list_archived_work_items(CONDUCTOR, after=seen[-1]) == ([], None)
+
+    def test_missing_history_is_read_only_and_scoped_to_one_conductor(self):
+        root = wl._work_ledger_root()
+        assert not root.exists()
+        assert wl.list_archived_work_items(CONDUCTOR) == ([], None)
+        assert not root.exists()
+        item_id = self._closed_item()
+        wl.archive_work_item(CONDUCTOR, item_id)
+        assert wl.list_archived_work_items("other-conductor") == ([], None)
+        assert wl.read_work_item("other-conductor", item_id) is None
+        assert not wl.conductor_dir("other-conductor").exists()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"limit": n} for n in (0, 33, True, 1.5, None)]
+        + [{"after": s} for s in ("../items", "it_00000001\n", None)],
+    )
+    def test_invalid_pagination_is_refused_without_creating_history(self, kwargs):
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.list_archived_work_items(CONDUCTOR, **kwargs)
+        assert caught.value.code == wl.CODE_INVALID_VALUE
+        assert not wl._work_ledger_root().exists()
+
+    def test_a_corrupt_page_advances_and_a_nonterminal_archive_cannot_resurrect(self):
+        ids = [f"it_{i:08x}" for i in range(1, 4)]
+        with mock.patch.object(wl, "mint_item_id", side_effect=ids):
+            for _ in ids:
+                wl.archive_work_item(CONDUCTOR, self._closed_item())
+        wl.archived_item_path(CONDUCTOR, ids[0]).write_bytes(b"{torn")
+        path = wl.archived_item_path(CONDUCTOR, ids[1])
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["state"] = "open"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        assert wl.list_archived_work_items(CONDUCTOR, limit=2) == ([], ids[1])
+        page, cursor = wl.list_archived_work_items(CONDUCTOR, after=ids[1], limit=2)
+        assert [item.item_id for item in page] == [ids[2]]
+        assert cursor is None
+        for item_id in ids[:2]:
+            before = wl.archived_item_path(CONDUCTOR, item_id).read_bytes()
+            assert wl.read_work_item(CONDUCTOR, item_id) is None
+            with pytest.raises(wl.WorkLedgerError) as caught:
+                wl.apply_worker_report(CONDUCTOR, item_id, status="done", summary="late")
+            assert caught.value.code == wl.CODE_UNKNOWN_ITEM
+            with pytest.raises(wl.WorkLedgerError) as caught:
+                wl.archive_work_item(CONDUCTOR, item_id)
+            assert caught.value.code == wl.CODE_UNKNOWN_ITEM
+            assert not wl.item_path(CONDUCTOR, item_id).exists()
+            assert wl.archived_item_path(CONDUCTOR, item_id).read_bytes() == before
+
+    def test_fallback_covers_a_move_between_stat_and_open(self):
+        item_id = self._closed_item()
+        source = wl.item_path(CONDUCTOR, item_id)
+        original = wl.read_work_item(CONDUCTOR, item_id)
+        real_read = wl.read_bytes_with_retry
+        moved = False
+
+        def move_before_read(path):
+            nonlocal moved
+            if path == source and not moved:
+                moved = True
+                wl.archive_work_item(CONDUCTOR, item_id)
+            return real_read(path)
+
+        with mock.patch.object(wl, "read_bytes_with_retry", side_effect=move_before_read):
+            assert wl.read_work_item(CONDUCTOR, item_id, strict=True) == original
+        assert moved
+        assert not source.exists()
+
+    def test_corrupt_or_unreadable_active_data_does_not_fall_back_to_archive(self):
+        item_id = self._closed_item()
+        source = wl.item_path(CONDUCTOR, item_id)
+        wl.archive_work_item(CONDUCTOR, item_id)
+        source.write_bytes(b"{torn")
+        assert wl.read_work_item(CONDUCTOR, item_id) is None
+        with mock.patch.object(wl, "read_bytes_with_retry", side_effect=PermissionError("denied")):
+            assert wl.read_work_item(CONDUCTOR, item_id) is None
+            with pytest.raises(PermissionError, match="denied"):
+                wl.read_work_item(CONDUCTOR, item_id, strict=True)
+
+    def test_archive_io_failures_propagate_to_page_reads_and_retry(self):
+        item_id = self._closed_item()
+        wl.archive_work_item(CONDUCTOR, item_id)
+        with mock.patch.object(wl, "read_bytes_with_retry", side_effect=OSError("unreadable")):
+            with pytest.raises(OSError, match="unreadable"):
+                wl.list_archived_work_items(CONDUCTOR)
+            with pytest.raises(OSError, match="unreadable"):
+                wl.archive_work_item(CONDUCTOR, item_id)
+
+    def test_unknown_item_does_not_create_an_archive(self):
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, "it_00000001")
+        assert caught.value.code == wl.CODE_UNKNOWN_ITEM
+        assert not wl.archive_dir(CONDUCTOR).exists()
+
+    def test_archive_directory_cannot_escape_the_conductor(self, tmp_path):
+        from conftest import make_dir_link
+
+        item_id = self._closed_item()
+        before = _bytes_on_disk(item_id)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        make_dir_link(wl.archive_dir(CONDUCTOR), outside)
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, item_id)
+        assert caught.value.code == wl.CODE_INVALID_VALUE
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.list_archived_work_items(CONDUCTOR)
+        assert caught.value.code == wl.CODE_INVALID_VALUE
+        assert _bytes_on_disk(item_id) == before
+        assert list(outside.iterdir()) == []
+
+    def test_archive_source_cannot_escape_the_conductor(self, tmp_path):
+        from conftest import make_dir_link
+
+        item_id = self._closed_item()
+        source_dir = wl.items_dir(CONDUCTOR)
+        outside = tmp_path / "outside"
+        source_dir.rename(outside)
+        make_dir_link(source_dir, outside)
+        before = {path.name: path.read_bytes() for path in outside.iterdir()}
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, item_id)
+        assert caught.value.code == wl.CODE_INVALID_VALUE
+        assert {path.name: path.read_bytes() for path in outside.iterdir()} == before
+        assert not wl.archive_dir(CONDUCTOR).exists()
+
+    def test_a_dangling_archive_link_is_a_conflict_and_reserves_its_id(self, tmp_path):
+        from conftest import make_dir_link
+
+        item_id = self._closed_item()
+        before = _bytes_on_disk(item_id)
+        target = wl.archived_item_path(CONDUCTOR, item_id)
+        target.parent.mkdir()
+        outside = tmp_path / "missing-target"
+        outside.mkdir()
+        make_dir_link(target, outside)
+        outside.rmdir()
+        with pytest.raises(wl.WorkLedgerError) as caught:
+            wl.archive_work_item(CONDUCTOR, item_id)
+        assert caught.value.code == wl.CODE_ARCHIVE_CONFLICT
+        assert _bytes_on_disk(item_id) == before
+        # Even with no active JSON, the occupied archive name cannot be reused.
+        wl.item_path(CONDUCTOR, item_id).unlink()
+        with mock.patch.object(wl, "mint_item_id", side_effect=[item_id, "it_01234567"]):
+            assert _new_item() == "it_01234567"
+        assert target.lstat()
+        assert not target.exists()
+        assert wl.item_events_path(CONDUCTOR, item_id).read_bytes() == before[1]
+
+    def test_archive_holds_conductor_then_original_item_lock_through_the_move(self):
+        item_id = self._closed_item()
+        held = []
+        real_lock = wl._open_lock
+        real_replace = wl.replace_with_retry
+
+        @contextmanager
+        def track_lock(path):
+            with real_lock(path):
+                held.append(path)
+                try:
+                    yield
+                finally:
+                    held.pop()
+
+        def check_move(source, target):
+            assert held == [
+                wl.conductor_dir(CONDUCTOR) / wl._LOCK_FILE,
+                wl._item_lock_path(CONDUCTOR, item_id),
+            ]
+            real_replace(source, target)
+
+        with (
+            mock.patch.object(wl, "_open_lock", side_effect=track_lock),
+            mock.patch.object(wl, "replace_with_retry", side_effect=check_move),
+        ):
+            assert wl.archive_work_item(CONDUCTOR, item_id).is_terminal
+        assert held == []
+
+    def test_concurrent_archive_retries_return_the_same_closed_item(self):
+        item_id = self._closed_item()
+        original = wl.read_work_item(CONDUCTOR, item_id)
+        before = _bytes_on_disk(item_id)
+        start = threading.Barrier(3, timeout=10)
+        results = [None, None]
+
+        def archive(index):
+            try:
+                start.wait()
+                results[index] = wl.archive_work_item(CONDUCTOR, item_id)
+            except Exception as exc:
+                results[index] = exc
+
+        threads = [threading.Thread(target=archive, args=(i,), daemon=True) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            start.wait()
+        finally:
+            for thread in threads:
+                thread.join(timeout=15)
+        assert not any(thread.is_alive() for thread in threads)
+        assert results == [original, original]
+        assert not wl.item_path(CONDUCTOR, item_id).exists()
+        assert wl.archived_item_path(CONDUCTOR, item_id).read_bytes() == before[0]
+        assert wl.item_events_path(CONDUCTOR, item_id).read_bytes() == before[1]
+
+
 # ── revertability ─────────────────────────────────────────────────────────
 
 
-#: The ONLY modules that may import the store. Phase 1 asserted the set was empty,
-#: which made that phase revertable by deleting two files; Phase 2 adds exactly ONE
-#: importer and the check becomes an allowlist rather than disappearing, because the
-#: intent it enforces outlived the empty set. One entry is the strong form of that
-#: intent: even ``mcp_work.py``, the server whose four tools this store exists for,
-#: does not import it — it reaches the store over the dashboard HTTP API like every
-#: other consumer, which is what keeps identity resolved server-side and lets the
-#: Crew page read the same rows. A second importer is therefore a design change —
-#: some module building paths or resolving identity for itself — and must argue for
-#: itself in review rather than arrive with a passing suite.
+#: Only these identity-resolving seams may touch the store. MCP callers and the
+#: browser use HTTP; the gateway also binds its own freshly allocated subagent.
 _PERMITTED_STORE_IMPORTERS = frozenset(
     {
-        # The four tools' HTTP routes, and the ONLY module that touches the store
-        # directly: identity comes from X-Session-Key, never from the body.
+        # Strict internal caller identity, never a body-supplied session.
         "dashboard/handlers/work_ledger.py",
+        # Owner identity plus the member's protected, current DM binding.
+        "dashboard/handlers/member_work.py",
+        # Gateway-derived parent and fresh subagent key, bound before provider start.
+        "subagent_manager/run.py",
     }
 )
 
@@ -1868,7 +2236,7 @@ _STORE_IMPORT_RE = re.compile(
 
 
 def test_only_the_phase_2_seams_import_the_module():
-    """The store reaches the product through two named modules and no others.
+    """The store reaches the product through named identity-resolving seams only.
 
     Asserted on IMPORT statements rather than any mention of the name, and the
     candidate set is asserted non-empty so a moved source tree fails this test

@@ -127,6 +127,83 @@ The loader is defensive about hand-edited config: a non-string `model` or
 `triggers` collapses to `""`, an unknown `reasoning_effort` collapses to inherit,
 and a junk watchdog override collapses to `0`.
 
+## Member tasks
+
+The right panel offers Tasks beside Crew summary after the member's thread is
+confirmed. Both tabs describe the selected member. Tasks uses the existing
+conductor work ledger. It polls every five seconds while visible. Cards show acceptance
+criteria, worker reports, decisions, verdicts, artifacts and recent events;
+opening a dashboard worker uses chat navigation; a spawned worker opens the
+member conversation with the existing Subagents panel focused on that run. Its
+tab is opened in the destination slot before navigation, so the chat's first
+mount restores it. Stale-progress warnings appear only after worker assignment.
+
+To do means unbound; In progress means bound; Blocked includes worker questions;
+Review means a worker reported done without a failed verdict; Done requires an
+accepted terminal state. Rejected and abandoned items are kept under Closed.
+These are projections of ledger fields, not freely draggable states. Sending
+instructions never advances a card optimistically.
+The ledger caps each active board at 32 unarchived items. The owner can archive
+accepted, rejected or abandoned tasks to free capacity. Archived tasks retain
+reports, evidence, decisions and recent events in a separate, paginated view
+loaded only on request. Open tasks cannot be archived. Worker bindings remain
+reserved, so a late report cannot reopen archived work.
+
+`GET /api/members/{slug}/work?member=<exact-name>&slot=<confirmed-slot>`
+returns the member's ledger plus its session checkpoint. The owner-only POST
+on the same path captures a title and acceptance criteria as an open item with
+`human_approval` acceptance. The supplied slot is a consistency check, never a
+ledger selector: the handler derives the current generation from config,
+checks the protected DM binding, live member slot and private memory proof,
+and revalidates after asynchronous reads. App and internal callers are refused;
+MCP work routes retain their internal caller gate and also verify protected
+private process identity. Archive list and mutation routes apply the same owner,
+exact-name and generation checks as capture.
+
+Creation saves a task without sending a turn. Send task sends its existing item
+id and criteria to the member through the normal steering transport. Additional
+task instructions use an explicit Give instructions action and a visible,
+clearable task selection. Expanding a card only discloses its details. General
+member instructions use the conversation composer. Review tasks offer Accept
+result and Reject result in a Review result menu beside Send instructions. The
+member records the decision and terminal state, and the board waits for the
+ledger update. Rejected or uncertain
+sends retain their drafts; an uncertain receipt directs the owner to check the
+conversation before retrying. Task and instruction drafts are scoped by exact
+member and conversation generation. The dashboard's in-memory store retains
+drafts and delivery outcomes across tab, member, overlay and route changes,
+including a response that arrives after leaving the member. Host panel bodies
+mount only while active. A page reload clears
+this temporary state. Worker navigation uses the existing leave guard for other
+open editors. Acceptance failures use `ErrorNotice`; agent help can leave the
+route without losing these task drafts.
+
+Response redaction walks the decoded structure iteratively, so valid deeply
+nested acceptance data remains readable. It masks credential-bearing
+strings and named credential values without parsing redacted text as JSON.
+Colliding redacted artifact labels receive distinct suffixes so every entry
+remains visible.
+
+On harnesses already supporting member session injection, `member_session_servers`
+mounts `kirocrew-work` alongside session control with the same session identity,
+gateway port and data home. Work tools gain no auto-approval. KAS names both
+servers in its tool projection. Other sessions and unsupported injection paths
+keep their existing templates. Active sessions receive the mount on their next
+session creation or resume. Worker reporting still requires a worker with work
+tools and a binding created by its conductor. Send task asks the member to use
+`spawn_run(work_item_id=..., agent="kirocrew-worker", task=...)`. This single-task
+option validates the item against the verified caller's own ledger. The existing
+spawn path inherits the member's memory and approval policy. After admission and
+approval, the manager binds its freshly generated worker identity before the
+first provider turn. Duplicate or closed-task dispatches refuse, including races
+between queue admission and execution. Work brief and report resolve the worker's
+own binding; they accept no caller-selected item or conductor. Global
+`session_control` restrictions for private members remain enforced.
+The default member chat backend is KAS; spawned workers use the existing task
+backend and worker template. No harness capability set or model default changes.
+Reports update the board; completion follows normal scoped spawn notification.
+Review still requires the owner's acceptance instruction before Done.
+
 ## Selection: the `select_crew` contract
 
 `select_crew` has two modes, both answered as JSON by `_do_select_crew`.

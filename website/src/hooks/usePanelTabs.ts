@@ -466,7 +466,7 @@ function serializeBucket(b: Bucket): string {
     .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.revealLine; return copy })
   // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
   // Only then: a focus that names no stored tab at all is a host's leading tab
-  // (`usePanelTabs(…, { leadingId })` — the Members page's Crew summary), which
+  // (`usePanelTabs(…, { leadingIds })` — the Members page's host tabs), which
   // lives outside the bucket by design and must come back as the focus on
   // reload rather than be replaced by whatever tab happens to be last.
   const droppedFocus = b.activeId !== null
@@ -580,17 +580,15 @@ export function usePanelTabs(
    *  persisted tab disappears. `[]` is a known-empty set and does hide app tabs. */
   panelTabDescriptors?: PanelTabDescriptor[],
   opts?: {
-    /** Id of a HOST-OWNED leading tab (SidePanel's `leadingTab`): a tab that
-     *  sits ahead of the pinned block, is never in the bucket, and whose body the
-     *  host renders. The bucket only ever holds it as `activeId`. Naming it here
-     *  is what lets focus fall back to it — a fresh strip opens on it rather than
-     *  on the first pinned view, and it is never "repaired" away by `syncPinned`
-     *  for not being a stored tab. */
-    leadingId?: string
+    /** Ordered host-owned focus targets (SidePanel's `leadingTabs`), never
+     *  stored as document tabs. The first is the default focus; `syncPinned`
+     *  preserves any of them when reconciling the stored tabs. */
+    leadingIds?: readonly string[]
   },
 ) {
   const key = bucketKey(slotKey)
-  const leadingId = opts?.leadingId
+  const leadingIds = opts?.leadingIds
+  const leadingId = leadingIds?.[0]
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
   // View-tab labels are re-resolved from `kind` on every read so the strip is in
@@ -692,7 +690,7 @@ export function usePanelTabs(
       // Refocus if the active tab was a pinned view that just went away. The
       // host's leading tab is a valid focus even though it is never a stored
       // tab; a strip with no usable focus lands on it (else the first pinned).
-      const activeId = b.activeId && (b.activeId === leadingId || nextTabs.some(t => t.id === b.activeId))
+      const activeId = b.activeId && (leadingIds?.includes(b.activeId) || nextTabs.some(t => t.id === b.activeId))
         ? b.activeId
         : (leadingId ?? (nextTabs.length ? nextTabs[0].id : null))
       // Bail if nothing actually changed (id sequence + focus) — avoids churn.
@@ -701,7 +699,7 @@ export function usePanelTabs(
       if (sameOrder && activeId === b.activeId) return b
       return { tabs: nextTabs, activeId }
     })
-  }, [update, leadingId])
+  }, [update, leadingId, leadingIds])
 
   const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:

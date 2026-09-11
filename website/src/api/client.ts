@@ -24,6 +24,7 @@ import type {
   WorkflowRunSummary,
 } from '../types'
 import type { RemoteCrewCapabilities } from '../hooks/useRemoteCapabilities'
+import type { MemberWork, MemberWorkArchive, MemberWorkItem } from '../types/memberWork'
 import type { MemoryRecord, MemoryRecordRef, MemoryRecordQuery, MemoryRecordSelection, MemoryEditOperation, MemoryEditPreview, MemoryRecordRevision } from '../types/memoryEditing'
 import type { AutoNudgeListResponse } from '../components/autoNudgeLoop'
 import { ApiError, friendlyErrText } from './apiError'
@@ -3039,6 +3040,18 @@ export const api = {
   // mode="member"), so this is also the only place a member slot key comes from.
   memberThread: (slug: string) =>
     post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
+  memberWork: (slug: string, member: string, slot: string) =>
+    fetch('/api/members/' + encodeURIComponent(slug) + '/work?' + new URLSearchParams({ member, slot }))
+      .then(j) as Promise<MemberWork>,
+  memberWorkArchive: (slug: string, member: string, slot: string, after = '') =>
+    fetch('/api/members/' + encodeURIComponent(slug) + '/work/archive?' + new URLSearchParams({ member, slot, after }))
+      .then(j) as Promise<MemberWorkArchive>,
+  archiveMemberTask: (slug: string, member: string, slot: string, item: string) =>
+    post('/api/members/' + encodeURIComponent(slug) + '/work/' + encodeURIComponent(item) + '/archive?' + new URLSearchParams({ member, slot }), {})
+      .then(j) as Promise<{ item: MemberWorkItem }>,
+  createMemberTask: (slug: string, member: string, slot: string, title: string, criteria: string) =>
+    post('/api/members/' + encodeURIComponent(slug) + '/work?' + new URLSearchParams({ member, slot }), { title, criteria })
+      .then(j) as Promise<{ item: MemberWorkItem; slot_key: string }>,
   // A member's recent activity pointers (real recorded signal only: session
   // participations and routing decisions). `member` is the exact crew name —
   // slugs are lossy, so the backend filters the shared log by exact name.

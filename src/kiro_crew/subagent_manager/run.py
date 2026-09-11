@@ -648,6 +648,27 @@ class RunEventCoordinator(ManagerComponent):
             info.parent_session_key,
             info.memory_store,
         )
+        if info.work_item_id:
+            from kiro_crew import session_ledger, work_ledger
+
+            # Only fresh scoped dispatches bind here. Queue admission and spawn
+            # approval precede this point; no provider can run before the durable
+            # binding lands. Worker identity comes from the manager, not a tool
+            # argument or agent-writable run metadata.
+            if session_key != f"subagent:{info.id}":
+                raise ValueError("A new work item requires a fresh worker conversation.")
+            conductor = session_ledger.ledger_key(info.parent_session_key)
+            binding = await asyncio.to_thread(work_ledger.read_binding, session_key)
+            if binding is None:
+                await asyncio.to_thread(
+                    work_ledger.apply_conductor_action,
+                    conductor,
+                    "bind",
+                    item_id=info.work_item_id,
+                    worker_session_key=session_key,
+                )
+            elif binding != (conductor, info.work_item_id):
+                raise ValueError("The worker is already bound to another task.")
         # Queue waits and restarts can outlive a member/store configuration.
         # Revalidate before allocating any provider process for the run.
         if info.memory_store:
