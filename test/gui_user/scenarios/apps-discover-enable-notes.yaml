@@ -1,0 +1,29 @@
+# Smoke: the App Store's core path -- find an app and turn it on. The builtin
+# catalog is bundled, so Discover lists the first-party apps without a network
+# request (the remote registry fetch fails closed on the target; a store
+# warning may show and is not a failure). "Notes" is a builtin that is off by
+# default and needs nothing external, so its row offers "Enable" and, once
+# enabled, reads "Enabled". Builtins skip the third-party trust prompt.
+name: apps-discover-enable-notes
+tier: smoke
+feature: apps
+user_story: >-
+  As a user, I want to browse the App Store and switch an app on from its row,
+  so that the app appears in my dashboard without leaving the store page.
+docs_url: docs/system-specs/modules/app-kit-platform.md
+summary: Open Discover, find the Notes app and enable it from its row
+preconditions:
+  seed: rich
+  members: [nova-sky]
+  start_url: /apps
+steps:
+  - You are on the Apps page, on its "Discover" tab (heading "Discover", subtitle about browsing agentic apps). If a notice says the store or registry could not be reached, ignore it; the built-in apps are listed anyway.
+  - Find the row for the app named "Notes" (use the search box on the page if the list is long) and read its right-hand side, which offers an "Enable" button.
+  - Click the "Enable" button on the "Notes" row.
+  - Wait two seconds for the row to update.
+expectations:
+  - The "Notes" row no longer shows an "Enable" button; in its place is a green "Enabled" label.
+  - No red error message about failing to enable the app is visible.
+  - A "Notes" entry has appeared in the left sidebar's list of apps (it may sit inside a collapsed apps group; only the row state above is required).
+max_steps: 12
+max_seconds: 300
