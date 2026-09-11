@@ -991,6 +991,42 @@ def _set_sync_status(store, source_id: str, status: str) -> None:
     store.db.commit()
 
 
+def _finalize_sync_status_write(store, source_id: str, status: str) -> bool:  # type: ignore[no-untyped-def]
+    """CAS a terminal state over a row still ``'syncing'``, in one off-loop take.
+
+    Compare-and-set for the reason ``_finalize_job`` documents: the terminal
+    paths race. A shutdown cancel can be delivered to the coroutine after the
+    success write's worker already committed 'synced', and a blind second
+    write would stamp 'error' over the state the work actually reached. Only
+    a row still mid-sync is moved, so the loser's write lands on nothing.
+    """
+    cur = store.db.execute(
+        "UPDATE sources SET sync_status = ? WHERE id = ? AND sync_status = 'syncing'",
+        (status, source_id))
+    store.db.commit()
+    return cur.rowcount > 0
+
+
+async def _finalize_sync_status(store, source_id: str, status: str) -> None:  # type: ignore[no-untyped-def]
+    """Write a terminal ``sync_status`` from a finalizer, and never raise.
+
+    Runs inside an ``except BaseException`` arm, so an exception escaping here
+    would mask the original one -- a failed DB write is logged and dropped
+    instead. A re-cancel can interrupt the ``await`` before the worker returns;
+    a worker already RUNNING completes, so a write in flight still lands (only
+    a re-cancel that arrives before the executor picks the item up can drop
+    it). Suppressing the re-cancel keeps the caller's original exception
+    current for its bare ``raise`` (the same shape as
+    ``_rebuild_embeddings_job``'s finalize).
+    """
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.to_thread(_finalize_sync_status_write, store, source_id, status)
+    except Exception:
+        logger.exception(
+            "Could not finalize sync_status=%r for source %s", status, source_id)
+
+
 def _claim_sync(store, source_id: str) -> bool:
     """Move a source into 'syncing' and report whether THIS call won it.
 
@@ -1356,8 +1392,20 @@ async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) ->
     the row at all in two cases: another sync already holds the claim, or the
     claim could not be taken -- neither is this source failing to sync.
     """
+    claim = asyncio.ensure_future(asyncio.to_thread(_claim_sync, store, source_id))
     try:
-        claimed = await asyncio.to_thread(_claim_sync, store, source_id)
+        claimed = await asyncio.shield(claim)
+    except asyncio.CancelledError:
+        # A cancel here does not stop the worker: the thread runs to completion
+        # and can still commit 'syncing' after this task is gone -- the same
+        # strand the work sites below close. Wait for the thread's answer and
+        # finalize only a claim THIS task won; a lost claim is a sibling sync's
+        # row. Everything is suppressed because a finalizer must never replace
+        # the cancellation.
+        with contextlib.suppress(BaseException):
+            if await claim:
+                await _finalize_sync_status(store, source_id, "error")
+        raise
     except Exception:
         # Failing to TAKE the work is not the work failing. 'error' is terminal --
         # sync_all skips an errored row on every sweep -- so stamping it for a
@@ -1387,9 +1435,23 @@ async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) ->
         # SyncScheduler.sync_source treats this exception the same way.
         logger.warning("Ingestion deferred by import budget for %s: %s", path, exc)
         await asyncio.to_thread(_set_sync_status, store, source_id, "pending")
-    except Exception:
-        logger.exception("Background ingestion failed for %s", path)
-        await asyncio.to_thread(_set_sync_status, store, source_id, "error")
+    except BaseException as exc:
+        # CancelledError is a BaseException in 3.8+, so an ``except Exception``
+        # arm let a shutdown cancel skip finalization and strand the row at
+        # 'syncing' -- every later sync then answers 409 with no recovery. A
+        # cancelled sync lands in 'error' like any other incomplete sync (no
+        # new status value: the settings UI and the watcher read this column),
+        # and the cancellation is re-raised so task semantics are preserved --
+        # shutdown drains ``_bg_tasks`` by cancelling them. The shape follows
+        # ``_rebuild_embeddings_job``, this file's precedent.
+        is_cancel = isinstance(exc, asyncio.CancelledError)
+        if is_cancel:
+            logger.debug("Background ingestion cancelled for %s", path)
+        else:
+            logger.exception("Background ingestion failed for %s", path)
+        await _finalize_sync_status(store, source_id, "error")
+        if is_cancel:
+            raise
 
 
 async def sync_source(request: web.Request) -> web.Response:
@@ -1463,8 +1525,16 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
     Claims 'syncing' first, for the reason ``_ingest_local_file_task`` documents:
     the claim is atomic and the task owns both ends of the row's lifecycle.
     """
+    claim = asyncio.ensure_future(asyncio.to_thread(_claim_sync, store, source_id))
     try:
-        claimed = await asyncio.to_thread(_claim_sync, store, source_id)
+        claimed = await asyncio.shield(claim)
+    except asyncio.CancelledError:
+        # Guarded for the reason _ingest_local_file_task documents: the claim
+        # thread outlives a cancel and can strand the row at 'syncing'.
+        with contextlib.suppress(BaseException):
+            if await claim:
+                await _finalize_sync_status(store, source_id, "error")
+        raise
     except Exception:
         # Failing to TAKE the work is not the work failing. 'error' is terminal --
         # sync_all skips an errored row on every sweep -- so stamping it for a
@@ -1498,9 +1568,17 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
             "Agent sync deferred by import budget: source=%s url=%s: %s", source_id, url, exc
         )
         await asyncio.to_thread(_set_sync_status, store, source_id, "pending")
-    except Exception:
-        logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
-        await asyncio.to_thread(_set_sync_status, store, source_id, "error")
+    except BaseException as exc:
+        # ``except BaseException`` for the reason _ingest_local_file_task
+        # documents: a cancel must not strand the row at 'syncing'.
+        is_cancel = isinstance(exc, asyncio.CancelledError)
+        if is_cancel:
+            logger.debug("Agent sync cancelled: source=%s url=%s", source_id, url)
+        else:
+            logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
+        await _finalize_sync_status(store, source_id, "error")
+        if is_cancel:
+            raise
 
 
 async def delete_source(request: web.Request) -> web.Response:
@@ -1776,7 +1854,10 @@ async def ingest_text(request: web.Request) -> web.Response:
         tmp.close()
         job_id = await pipeline.ingest_file(tmp.name, original_name=name,
                                             namespace=namespace, source_id=source_id)
-        # Update source status
+        # Update source status. INVARIANT: the 'synced' write and the
+        # source.ingest_text audit ride in ONE worker take (_audited_write), with
+        # no await between them -- that is what makes the audit un-skippable by a
+        # cancellation. Do not split them or move one off-loop on its own.
         await _audited_write(
             partial(_set_sync_status, store, source_id, "synced"),
             event="source.ingest_text", fields={"source_id": source_id, "name": name})
@@ -1788,8 +1869,18 @@ async def ingest_text(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": str(exc), "code": "import_budget_exceeded"},
             status=429)
-    except Exception:
-        logger.exception("Agent ingest_text failed for source %s", source_id)
+    except BaseException as exc:
+        # ``except BaseException`` for the reason _ingest_local_file_task
+        # documents: a cancel during ``ingest_file`` must not strand the row at
+        # 'syncing'. Non-cancel failures keep the existing 500 body.
+        is_cancel = isinstance(exc, asyncio.CancelledError)
+        if is_cancel:
+            logger.debug("Agent ingest_text cancelled for source %s", source_id)
+        else:
+            logger.exception("Agent ingest_text failed for source %s", source_id)
+        await _finalize_sync_status(store, source_id, "error")
+        if is_cancel:
+            raise
         return web.json_response({"error": "internal server error"}, status=500)
     finally:
         Path(tmp.name).unlink(missing_ok=True)
@@ -2025,7 +2116,7 @@ async def ingest_file(request: web.Request) -> web.Response:
                     count_toward_import_budget=False,
                     import_budget_token=budget_token,
                 )
-            except Exception:
+            except BaseException as exc:
                 # No dedicated ImportChunkBudgetError branch here, and none is
                 # reachable from the front door: admission was reserved above, so
                 # an exhausted window answered 429 before this task existed and
@@ -2035,8 +2126,16 @@ async def ingest_file(request: web.Request) -> web.Response:
                 # unlinks, and an upload:// source has no re-fetchable URI, so
                 # unlike the local_file / agent-url paths there is nothing to
                 # retry from and 'pending' would promise one.
-                logger.exception("Background ingestion failed for %s", filename)
-                await asyncio.to_thread(_set_sync_status, store, src_id, "error")
+                # ``except BaseException`` for the reason _ingest_local_file_task
+                # documents: a cancel must not strand the row at 'syncing'.
+                is_cancel = isinstance(exc, asyncio.CancelledError)
+                if is_cancel:
+                    logger.debug("Background ingestion cancelled for %s", src_id)
+                else:
+                    logger.exception("Background ingestion failed for %s", filename)
+                await _finalize_sync_status(store, src_id, "error")
+                if is_cancel:
+                    raise
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 

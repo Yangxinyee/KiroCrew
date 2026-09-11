@@ -43,7 +43,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.dashboard.handlers import knowledge as kh
@@ -1034,3 +1034,265 @@ class TestOnlyTheFinalizeThatLandedIsAudited:
 def _props(store, source_id: str) -> dict:
     row = store.db.execute("SELECT properties FROM sources WHERE id = ?", (source_id,)).fetchone()
     return json.loads(row["properties"]) if row["properties"] else {}
+
+
+class TestCancellationFinalizesSyncStatus:
+    """Issue #9280: a cancel must never strand a source at 'syncing'.
+
+    ``CancelledError`` is a ``BaseException`` (3.8+), so the old
+    ``except Exception`` finalizers let a shutdown cancel skip the terminal
+    ``sync_status`` write -- the row stayed 'syncing' and every later sync
+    answered 409 forever. Each path must land the row in 'error' (the existing
+    terminal vocabulary; a cancelled sync presents like a failed one) and
+    RE-RAISE, because aiohttp shutdown drains ``_bg_tasks`` by cancelling them
+    and swallowing the cancel would break task semantics. The shape mirrors
+    ``_rebuild_embeddings_job``, the file's own precedent.
+    """
+
+    @staticmethod
+    async def _wait_until(predicate, timeout: float = 5.0) -> None:
+        for _ in range(int(timeout / 0.01)):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("condition never became true")
+
+    @pytest.mark.asyncio
+    async def test_cancelled_local_file_ingest_lands_in_error(self, store, tmp_path):
+        source_id = await asyncio.to_thread(_seed_source, store)
+        doc = tmp_path / "doc.md"
+        doc.write_text("# hi\n")
+        started = asyncio.Event()
+
+        async def _hang(*_a, **_k):
+            started.set()
+            await asyncio.Event().wait()
+
+        pipeline = MagicMock(ingest_file=AsyncMock(side_effect=_hang))
+        task = asyncio.ensure_future(
+            kh._ingest_local_file_task(pipeline, store, str(doc), source_id)
+        )
+        await asyncio.wait_for(started.wait(), 5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_agent_sync_lands_in_error(self, store, monkeypatch):
+        source_id = await asyncio.to_thread(_seed_source, store)
+        started = asyncio.Event()
+
+        async def _hang_fetch(_url, _pool):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(kh, "fetch_url_content", _hang_fetch)
+        task = asyncio.ensure_future(
+            kh._background_agent_sync(
+                source_id, "https://example.com/x", "x", store, MagicMock(), MagicMock()
+            )
+        )
+        await asyncio.wait_for(started.wait(), 5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_upload_ingest_lands_in_error(self, store, monkeypatch):
+        monkeypatch.setattr(kh, "_sel_log", lambda tool, **kw: None)
+        started = asyncio.Event()
+
+        async def _hang_ingest(_tmp_path, **_kw):
+            started.set()
+            await asyncio.Event().wait()
+
+        pipeline = MagicMock(
+            ingest_file=AsyncMock(side_effect=_hang_ingest),
+            reserve_import_budget=AsyncMock(return_value=None),
+            release_import_budget=MagicMock(),
+        )
+        app = _make_app(store, pipeline=pipeline)
+        async with TestClient(TestServer(app)) as client:
+            form = aiohttp.FormData()
+            form.add_field("file", b"# hello\n", filename="notes.md", content_type="text/markdown")
+            resp = await client.post("/api/knowledge/ingest", data=form)
+            assert resp.status == 200, await resp.text()
+            source_id = (await resp.json())["source_id"]
+            await asyncio.wait_for(started.wait(), 5.0)
+            task = next(t for t in app["_bg_tasks"] if not t.done())
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_ingest_text_reraises_and_lands_in_error(self, store, monkeypatch):
+        """The handler variant: the cancel propagates (aiohttp owns it) AND the
+        row is finalized on the way out."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        # The agent posts while a sync holds the row -- that is the state the
+        # CAS finalize moves; a row not mid-sync is deliberately left alone.
+        await asyncio.to_thread(_set_status, store, source_id, "syncing")
+        pipeline = MagicMock(ingest_file=AsyncMock(side_effect=asyncio.CancelledError()))
+        app = _make_app(store, pipeline=pipeline)
+
+        async def _body(_request, max_bytes=None, **_kw):
+            return {"text": "hello"}, None
+
+        monkeypatch.setattr(kh, "read_bounded_json", _body)
+        req = make_mocked_request(
+            "POST",
+            f"/api/knowledge/sources/{source_id}/ingest-text",
+            match_info={"id": source_id},
+            app=app,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await kh.ingest_text(req)
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_plain_ingest_text_failure_still_500s_and_lands_in_error(self, store):
+        """Regression: widening to BaseException must not change the non-cancel
+        contract -- a plain failure still answers the existing 500 body."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        await asyncio.to_thread(_set_status, store, source_id, "syncing")
+        pipeline = MagicMock(ingest_file=AsyncMock(side_effect=RuntimeError("boom")))
+        app = _make_app(store, pipeline=pipeline)
+        app.router.add_post("/api/knowledge/sources/{id}/ingest-text", kh.ingest_text)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                f"/api/knowledge/sources/{source_id}/ingest-text", json={"text": "x"}
+            )
+            assert resp.status == 500
+            assert (await resp.json())["error"] == "internal server error"
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_plain_local_file_failure_still_lands_in_error(self, store, tmp_path):
+        """Regression: the background task's plain-Exception arm is unchanged."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        doc = tmp_path / "doc.md"
+        doc.write_text("# hi\n")
+        pipeline = MagicMock(ingest_file=AsyncMock(side_effect=RuntimeError("boom")))
+        await kh._ingest_local_file_task(pipeline, store, str(doc), source_id)
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_successful_ingest_text_still_writes_synced_and_audits(self, store, monkeypatch):
+        """The success invariant: 'synced' and the source.ingest_text audit ride
+        one worker take, so a normal run emits both."""
+        seen: list[str] = []
+        monkeypatch.setattr(kh, "_sel_log", lambda tool, **kw: seen.append(tool))
+        source_id = await asyncio.to_thread(_seed_source, store)
+        pipeline = MagicMock(ingest_file=AsyncMock(return_value="job-9"))
+        app = _make_app(store, pipeline=pipeline)
+        app.router.add_post("/api/knowledge/sources/{id}/ingest-text", kh.ingest_text)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                f"/api/knowledge/sources/{source_id}/ingest-text", json={"text": "hello"}
+            )
+            assert resp.status == 200
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "synced"
+        assert "source.ingest_text" in seen
+
+    @pytest.mark.asyncio
+    async def test_a_failed_finalize_write_does_not_mask_the_cancel(self, store, monkeypatch):
+        """A finalizer must never replace the original exception: a DB failure
+        inside the terminal write is logged and dropped, and the cancel still
+        propagates."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        started = asyncio.Event()
+
+        async def _hang_fetch(_url, _pool):
+            started.set()
+            await asyncio.Event().wait()
+
+        attempts: list[str] = []
+
+        def _boom_write(_store, _sid, status):
+            attempts.append(status)
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(kh, "fetch_url_content", _hang_fetch)
+        task = asyncio.ensure_future(
+            kh._background_agent_sync(
+                source_id, "https://example.com/x", "x", store, MagicMock(), MagicMock()
+            )
+        )
+        await asyncio.wait_for(started.wait(), 5.0)
+        monkeypatch.setattr(kh, "_finalize_sync_status_write", _boom_write)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert attempts == ["error"], "the terminal write was never attempted"
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_the_claim_take_still_finalizes(self, store, monkeypatch):
+        """A cancel delivered while the claim's worker is in flight does not
+        stop the thread: it commits 'syncing' after the task is gone. The
+        claim await must therefore finalize a claim it WON on the way out."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        entered = threading.Event()
+        release = threading.Event()
+        real_claim = kh._claim_sync
+
+        def _slow_claim(s, sid):
+            entered.set()
+            release.wait(5.0)
+            return real_claim(s, sid)
+
+        monkeypatch.setattr(kh, "_claim_sync", _slow_claim)
+        pipeline = MagicMock(ingest_file=AsyncMock())
+        task = asyncio.ensure_future(
+            kh._ingest_local_file_task(pipeline, store, "/tmp/x.md", source_id)
+        )
+        await asyncio.to_thread(entered.wait, 5.0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        pipeline.ingest_file.assert_not_awaited()
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_a_lost_claim_leaves_the_siblings_row_alone(
+        self, store, monkeypatch
+    ):
+        """A lost claim belongs to the sibling sync that holds it: the cancel
+        path must not stamp 'error' over a row another task is working on."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        await asyncio.to_thread(_set_status, store, source_id, "syncing")
+        entered = threading.Event()
+        release = threading.Event()
+        real_claim = kh._claim_sync
+
+        def _slow_claim(s, sid):
+            entered.set()
+            release.wait(5.0)
+            return real_claim(s, sid)  # loses: the row is already 'syncing'
+
+        monkeypatch.setattr(kh, "_claim_sync", _slow_claim)
+        pipeline = MagicMock(ingest_file=AsyncMock())
+        task = asyncio.ensure_future(
+            kh._ingest_local_file_task(pipeline, store, "/tmp/x.md", source_id)
+        )
+        await asyncio.to_thread(entered.wait, 5.0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "syncing"
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_compare_and_set_over_syncing(self, store):
+        """A late cancel finalize must not overwrite a committed 'synced': only
+        a row still mid-sync is moved (same rule as ``_finalize_job``)."""
+        source_id = await asyncio.to_thread(_seed_source, store)
+        await asyncio.to_thread(_set_status, store, source_id, "synced")
+        await kh._finalize_sync_status(store, source_id, "error")
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "synced"
+        await asyncio.to_thread(_set_status, store, source_id, "syncing")
+        await kh._finalize_sync_status(store, source_id, "error")
+        assert await asyncio.to_thread(_sync_status, store, source_id) == "error"
