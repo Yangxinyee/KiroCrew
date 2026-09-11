@@ -1,0 +1,32 @@
+# Smoke: the keyboard path to any page. Ctrl+K (Cmd+K on macOS) opens the
+# quick-search slot; on a fresh install the Command Bar builtin owns that slot
+# (it is enabled by default), so the surface reads "Type a command…" and lists
+# commands, apps and settings without a network request. Typing a page name
+# and pressing Enter navigates. The topbar also carries a "Search everywhere"
+# trigger for mouse users; the scenario uses the keyboard because that is the
+# path the feature exists for.
+name: search-everywhere-open-schedule
+tier: smoke
+feature: search
+user_story: >-
+  As a user, I want one keyboard shortcut that searches commands, apps, pages
+  and settings and takes me straight to what I typed, so that I can reach any
+  part of the dashboard without hunting through the sidebar.
+docs_url: docs/system-specs/modules/command-bar.md
+summary: Open Search Everywhere with Ctrl+K, type Schedule, press Enter and land on the Schedule page
+preconditions:
+  seed: rich
+  members: [nova-sky]
+  start_url: /chat
+steps:
+  - You are on the chat page. Click once on an empty part of the conversation area so the page (not the message box) has focus.
+  - Press Ctrl+K. A search box opens in the middle of the screen; its placeholder reads "Type a command…" (or "Search…" if the plain search palette is showing instead -- either is fine).
+  - Type exactly "Schedule" and wait a moment for the result list to filter.
+  - With a result named "Schedule" highlighted (press the Down arrow once if the first highlighted row is something else), press Enter.
+  - Wait a second for the page to change.
+expectations:
+  - The search box has closed.
+  - The main area now shows the Schedule page, with the heading "Schedule" and a List / Calendar / Executions switcher, and a table listing the job "daily rich fixture ping".
+  - The "Schedule" item is highlighted as active in the left rail.
+max_steps: 12
+max_seconds: 300
