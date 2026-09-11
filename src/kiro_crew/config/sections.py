@@ -3389,8 +3389,8 @@ class SkillsConfig:
         metadata=_meta(
             "Generate Skill Scripts",
             "When true, deterministic procedures may generate a validated Python "
-            "helper script alongside the SKILL.md. Script-bearing skills always "
-            "require approval.",
+            "helper script alongside the SKILL.md. Skills that bundle a validated "
+            "script always require approval.",
         ),
     )
     judge_model: str = field(
