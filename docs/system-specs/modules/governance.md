@@ -1916,7 +1916,36 @@ read-your-writes should add it deliberately, with its own tests.
   is deliberately NOT added to the deny-floor targets: that plane matches raw
   text and operator regexes, where `mcp__<server>` is a different string from
   the canonical identity a rule is written against rather than a broader form of
-  it. A server-only identity never satisfies auto-approval. Because this
+  it. A server-only identity never satisfies auto-approval. **Several spellings
+  of one tool.** A KAS built-in reaches the gate under its raw engine id
+  (`str_replace`) while the operator's rule is written under the kiro-cli name
+  it governs (`fs_write`); the two are one tool, not two targets, and asking
+  them as two targets would demand that an allow-mode rule name a raw id no
+  operator wrote. `gate_decision` therefore takes `alias_groups` -- tuples of
+  spellings for ONE tool -- and answers each group as one question: DENIED if
+  any spelling meets an explicit deny rule at either level (a deny-mode
+  `tools.deny: ["str_replace"]` still binds), otherwise PERMITTED when EACH
+  governing level permits SOME spelling -- OR within a level, intersection
+  across levels, so a ceiling granting `str_replace` beneath a profile granting
+  `fs_write` admits the one tool both granted. A group member that is also the
+  display title covers the title, which is then not asked again as a lone item
+  the allow set would have to carry. `deny_aliases` is the one-way counterpart:
+  spellings whose rules may REFUSE the call but never admit it. A KAS
+  `delete_file` reads under `fs_write` because an operator who denied writes
+  denied deletes, yet kiro-cli's `fs_write` cannot delete, so an allow-mode rule
+  naming `fs_write` must not become a deletion grant -- each deny alias is asked
+  for an explicit deny only, an allow-mode miss on it is not a refusal, and the
+  identity itself still has to be permitted on its own name. Both are empty for
+  every first-class harness; `HookManager.on_tool_call` fills them from the KAS
+  vocabulary tables (`platform/tool_names.py`, `policy_aliases` /
+  `policy_alias_split`) only for a server-less trusted identity those tables
+  know, on a permission event the KAS harness built (`kas_builtin_ids`) -- an
+  MCP-served call keeps exactly the targets it had, and another harness that
+  stamps the same bare id is asked under that id alone. This admits more than
+  asking the raw id by itself did: an allow-mode `tools: ["fs_write"]` now
+  permits a KAS `str_replace` / `fs_append` (and `fs_read` / `grep` / `glob`
+  permit the KAS read and search ids), which is the kiro-cli parity the table
+  exists for; `delete_file` is not admitted by `fs_write`. Because this
   enforcement is
   on the common path, the first-party app-own auto-approve below does **not**
   repeat it; what remains load-bearing there is the identity requirement itself
